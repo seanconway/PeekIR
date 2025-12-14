@@ -1,3 +1,5 @@
+If you have any questions feel free to reach out to me @ arikrahman300@gmail.com or arik.fm on discord
+
 # SafeHaven
 
 SafeHaven is an automated system designed to detect human presence using computer vision and perform targeted Synthetic Aperture Radar (SAR) scans using a 2-axis gantry system.
@@ -69,18 +71,34 @@ The system operates in the following sequence:
 
 ### Prerequisites
 *   Python 3.9+
+*   uv (Python package installer)
 *   Raspberry Pi (for the main controller)
 *   Arduino (for motor control)
 *   MATLAB (for data processing)
 
 ### Python Dependencies
-Install the required packages using pip:
+First, install uv if not already installed:
 
 ```bash
-pip install matplotlib numpy opencv-python pynput ultralytics torch torchvision torchaudio pandas requests
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-*Note: See `SoftwareDemo/pyproject.toml` for the specific dependencies of the main demo.*
+Then, install the required packages using uv sync:
+
+```bash
+uv sync
+```
+
+This will install all dependencies listed in `pyproject.toml`.
+
+For the SoftwareDemo specifically:
+
+```bash
+cd SoftwareDemo
+uv sync
+```
+
+*Note: The project uses uv for dependency management. If you prefer manual installation, you can use `uv pip install matplotlib numpy opencv-python pynput ultralytics torch torchvision torchaudio pandas requests`.*
 
 ## Usage
 
