@@ -6,6 +6,8 @@ SafeHaven is an automated system designed to detect human presence using compute
 
 ## Project Overview
 
+You're going to want to clone this repository on the Raspberry Pi 5 as well as the computer with mmWave installed onto it. Check out the software manual for mmWave studio setup tutorial.
+
 The system operates in the following sequence:
 1.  **Detection**: A camera (PiCamera) captures the scene.
 2.  **Identification**: YOLO (You Only Look Once) object detection identifies people in the frame.
