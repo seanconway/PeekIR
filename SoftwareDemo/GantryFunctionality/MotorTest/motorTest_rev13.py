@@ -147,10 +147,10 @@ if any(arg in ('-h', '--help', 'help') for arg in sys.argv[1:]):
 # GPIO 13 -> PWM0 (Channel 1)
 # GPIO 12 -> PWM0 (Channel 0)
 # Note: On this RPi 5, the RP1 PWM controller appears as pwmchip0.
-pulX = HardwarePWM(pwm_channel=1, hz=f_x, chip=0)
+pulX = HardwarePWM(pwm_channel=1, hz=f_x, chip=2)
 dirX = DigitalOutputDevice(DIR_PIN_X, 
                            active_high=True)  # Active high to rotate CW
-pulY = HardwarePWM(pwm_channel=0, hz=f_y, chip=0)
+pulY = HardwarePWM(pwm_channel=0, hz=f_y, chip=2)
 dirY = DigitalOutputDevice(DIR_PIN_Y, 
                            active_high=True)  # Active high to rotate CW
 
