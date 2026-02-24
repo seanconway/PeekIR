@@ -3,8 +3,8 @@ import numpy as np
 import cv2
 import time
 
-SPI_BUS = 0
-SPI_DEVICE = 1  # CE1 (GPIO7)
+SPI_BUS = 10
+SPI_DEVICE = 0  # CE0 (GPIO7)
 SPI_SPEED = 20000000
 PACKET_SIZE = 164
 PACKETS_PER_SEGMENT = 60
