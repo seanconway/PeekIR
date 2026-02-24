@@ -15,6 +15,8 @@ dependencies = [
     "ultralytics",
     "gpiozero",
     "rpi-hardware-pwm ; sys_platform == 'linux'",
+    "smbus2",
+    "spidev",
 ]
 
 [[tool.uv.index]]

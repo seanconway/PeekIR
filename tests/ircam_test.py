@@ -1,9 +1,12 @@
 import spidev
+import smbus2
 import numpy as np
 import cv2
 import time
 from collections import Counter
+import struct
 
+# SPI Configuration
 SPI_BUS = 10
 SPI_DEVICE = 0  # CE0 (GPIO7)
 SPI_SPEED = 20000000
@@ -12,6 +15,110 @@ PACKETS_PER_SEGMENT = 60
 SEGMENTS = 4
 MAX_DISCARD_BEFORE_RESYNC = 750  # ~4 frames worth at 27Hz
 MAX_RESYNC_ATTEMPTS = 5
+
+# I2C Configuration (CCI - Command and Control Interface)
+I2C_BUS = 10  # Same bus as SPI based on hardware
+LEPTON_I2C_ADDRESS = 0x2A
+CCI_STATUS_REG = 0x0002
+CCI_COMMAND_REG = 0x0004
+CCI_DATA_LENGTH_REG = 0x0006
+CCI_DATA_0_REG = 0x0008
+
+# Lepton Commands
+CMD_SYS_PING = 0x0200
+CMD_SYS_STATUS = 0x0204
+CMD_SYS_RUN_FFC = 0x0242  # Run flat field correction
+CMD_SYS_READY = 0x0204  # Camera ready status
+CMD_AGC_ENABLE = 0x0100  # Enable AGC for better visibility
+CMD_VID_OUTPUT_FORMAT = 0x0300  # Video output format
+
+print(f"[INIT] Initializing Lepton 3.x camera...")
+print(f"[INIT] Opening I2C bus {I2C_BUS} for camera control...")
+
+# Initialize I2C
+try:
+    i2c = smbus2.SMBus(I2C_BUS)
+    print(f"[INIT] I2C bus opened successfully")
+except Exception as e:
+    print(f"[ERROR] Failed to open I2C bus: {e}")
+    print(f"[ERROR] Camera may not be controllable via I2C")
+    i2c = None
+
+def cci_write_register(reg_addr, value):
+    """Write a 16-bit value to a Lepton CCI register"""
+    if i2c is None:
+        return False
+    try:
+        # Write 16-bit register address as two bytes (big-endian)
+        # Write 16-bit value as two bytes (big-endian)
+        data = [(value >> 8) & 0xFF, value & 0xFF]
+        i2c.write_i2c_block_data(LEPTON_I2C_ADDRESS, (reg_addr >> 8) & 0xFF, 
+                                  [(reg_addr & 0xFF)] + data)
+        return True
+    except Exception as e:
+        print(f"[I2C] Write failed to reg 0x{reg_addr:04X}: {e}")
+        return False
+
+def cci_read_register(reg_addr):
+    """Read a 16-bit value from a Lepton CCI register"""
+    if i2c is None:
+        return None
+    try:
+        # Write register address
+        i2c.write_byte_data(LEPTON_I2C_ADDRESS, (reg_addr >> 8) & 0xFF, reg_addr & 0xFF)
+        time.sleep(0.001)
+        # Read 16-bit value
+        data = i2c.read_i2c_block_data(LEPTON_I2C_ADDRESS, 0, 2)
+        return (data[0] << 8) | data[1]
+    except Exception as e:
+        print(f"[I2C] Read failed from reg 0x{reg_addr:04X}: {e}")
+        return None
+
+def cci_wait_busy():
+    """Wait for camera to complete previous command"""
+    if i2c is None:
+        return False
+    max_wait = 100  # 100ms max
+    for _ in range(max_wait):
+        try:
+            status = cci_read_register(CCI_STATUS_REG)
+            if status is not None and (status & 0x01) == 0:  # Bit 0 = busy
+                return True
+        except:
+            pass
+        time.sleep(0.001)
+    print(f"[I2C] Timeout waiting for camera ready")
+    return False
+
+def init_lepton_i2c():
+    """Initialize Lepton camera via I2C"""
+    if i2c is None:
+        print(f"[I2C] Skipping I2C initialization (bus not available)")
+        return False
+    
+    print(f"[I2C] Initializing camera via CCI (I2C address 0x{LEPTON_I2C_ADDRESS:02X})...")
+    
+    try:
+        # Test I2C communication with ping
+        print(f"[I2C] Testing communication...")
+        cci_wait_busy()
+        
+        # Try to read status register
+        status = cci_read_register(CCI_STATUS_REG)
+        if status is not None:
+            print(f"[I2C] Camera status: 0x{status:04X}")
+            print(f"[I2C] I2C communication OK")
+            return True
+        else:
+            print(f"[I2C] Failed to read camera status")
+            return False
+            
+    except Exception as e:
+        print(f"[I2C] Initialization failed: {e}")
+        return False
+
+# Initialize I2C connection to camera
+init_lepton_i2c()
 
 print(f"[INIT] Opening SPI bus {SPI_BUS}, device {SPI_DEVICE}")
 spi = spidev.SpiDev()
@@ -227,4 +334,6 @@ finally:
     print("[CLEANUP] Closing windows and SPI...")
     cv2.destroyAllWindows()
     spi.close()
+    if i2c is not None:
+        i2c.close()
     print("[CLEANUP] Done.")
