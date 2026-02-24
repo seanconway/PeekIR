@@ -5,15 +5,16 @@
 -- =================================================================================
 -- CONFIGURATION
 -- =================================================================================
-local root_path = "C:\\Users\\arikrahman\\Documents\\GitHub\\SafeHaven\\Safehaven-Lua\\"
+local root_path = "C:\\Users\\sean_\\projects\\PeekIR\\PeekIR\\Safehaven-Lua\\"
 local num_y_steps = 40         -- Number of steps in the Y direction
 local frame_periodicity = 18   -- ms
 local num_frames = 800         -- Total frames per scan
 -- Frame Duration = 800 * 18ms = 14400ms (14.4s)
 
 -- Gantry Configuration
-local ssh_host = "corban@10.244.182.88"
-local remote_dir = "/home/corban/Documents/GitHub/SafeHaven/SoftwareDemo/GantryFunctionality/MotorTest"
+local ssh_host = "peekir@10.247.232.157"
+local ssh_exe = "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+local remote_dir = "PeekIR/SoftwareDemo/GantryFunctionality/MotorTest"
 local python_script = "motorTest_rev13.py"
 local x_dist_mm = 280
 local y_step_mm = 1
@@ -28,20 +29,18 @@ local log_file = ""
 -- =================================================================================
 function RunRemoteCommandAsync(args)
     -- Construct the PowerShell command
-    -- Using full path to pwsh.exe to avoid PATH issues
+    -- Using full path to pwsh.exe and ssh.exe to avoid PATH issues
     local pwsh_exe = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
     
     -- Add 'silent' to the python arguments
     local args_with_flag = args .. " silent"
     
-    -- The command we want to run on the remote machine:
-    -- zsh -l -i -c 'cd <dir>; uv run <script> <args>'
-    local remote_cmd_inner = string.format("cd %s; uv run %s %s", remote_dir, python_script, args_with_flag)
+    -- The command we want to run on the remote machine with sudo for hardware PWM:
+    local remote_cmd_inner = string.format("cd %s; sudo .venv/bin/python %s %s", remote_dir, python_script, args_with_flag)
     local remote_shell_cmd = string.format("zsh -l -i -c '%s'", remote_cmd_inner)
     
-    -- The SSH command line:
-    -- Added -t to allocate pseudo-tty
-    local ssh_cmd_str = string.format("ssh -t %s \\\"%s\\\"", ssh_host, remote_shell_cmd)
+    -- The SSH command line using full path to ssh.exe:
+    local ssh_cmd_str = string.format("\\\"%s\\\" -t %s \\\"%s\\\"", ssh_exe, ssh_host, remote_shell_cmd)
     
     -- The full PowerShell command line:
     -- Uses 'start /min' WITHOUT /wait. Returns immediately.
@@ -56,11 +55,11 @@ function ResetGantryPosition()
     
     local pwsh_exe = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
     
-    -- The exact command requested by user
-    local remote_cmd = "cd /home/corban/Documents/GitHub/SafeHaven/SoftwareDemo/GantryFunctionality/MotorTest; uv run motorTest_rev13.py facetrack --wait-and-see; cd /home/corban/Documents/GitHub/SafeHaven/SoftwareDemo/GantryFunctionality/MotorTest; uv run motorTest_rev13.py down=500mm left=150mm"
+    -- The exact command requested by user (with sudo for hardware PWM)
+    local remote_cmd = "cd PeekIR/SoftwareDemo/GantryFunctionality/MotorTest; sudo .venv/bin/python motorTest_rev13.py facetrack --wait-and-see; cd PeekIR/SoftwareDemo/GantryFunctionality/MotorTest; sudo .venv/bin/python motorTest_rev13.py down=500mm left=150mm"
     
     local remote_shell_cmd = string.format("zsh -l -i -c '%s'", remote_cmd)
-    local ssh_cmd_str = string.format("ssh -t %s \\\"%s\\\"", ssh_host, remote_shell_cmd)
+    local ssh_cmd_str = string.format("\\\"%s\\\" -t %s \\\"%s\\\"", ssh_exe, ssh_host, remote_shell_cmd)
     
     -- Blocking command using start /wait /min to ensure it finishes before scanning starts
     -- We do NOT pipe to log_file here because log_file is not yet set for the new iteration
