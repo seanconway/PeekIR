@@ -7,7 +7,7 @@ from collections import Counter
 import struct
 
 # SPI Configuration
-SPI_BUS = 10
+SPI_BUS = 0
 SPI_DEVICE = 0  # CE0 (GPIO7)
 SPI_SPEED = 20000000
 PACKET_SIZE = 164
@@ -17,7 +17,7 @@ MAX_DISCARD_BEFORE_RESYNC = 750  # ~4 frames worth at 27Hz
 MAX_RESYNC_ATTEMPTS = 5
 
 # I2C Configuration (CCI - Command and Control Interface)
-I2C_BUS = 10  # Same bus as SPI based on hardware
+I2C_BUS = 1  # Same bus as SPI based on hardware
 LEPTON_I2C_ADDRESS = 0x2A
 CCI_STATUS_REG = 0x0002
 CCI_COMMAND_REG = 0x0004
