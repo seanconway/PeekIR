@@ -7,7 +7,7 @@ from collections import Counter
 import struct
 
 # SPI Configuration
-SPI_BUS = 0
+SPI_BUS = 10  # Raspberry Pi 5 SPI bus
 SPI_DEVICE = 0  # CE0 (GPIO7)
 SPI_SPEED = 20000000
 PACKET_SIZE = 164
@@ -17,7 +17,7 @@ MAX_DISCARD_BEFORE_RESYNC = 750  # ~4 frames worth at 27Hz
 MAX_RESYNC_ATTEMPTS = 5
 
 # I2C Configuration (CCI - Command and Control Interface)
-I2C_BUS = 1  # Same bus as SPI based on hardware
+I2C_BUS = 1  # Standard Raspberry Pi I2C bus
 LEPTON_I2C_ADDRESS = 0x2A
 CCI_STATUS_REG = 0x0002
 CCI_COMMAND_REG = 0x0004
@@ -99,15 +99,33 @@ def init_lepton_i2c():
     print(f"[I2C] Initializing camera via CCI (I2C address 0x{LEPTON_I2C_ADDRESS:02X})...")
     
     try:
-        # Test I2C communication with ping
+        # Wait for camera to boot (cameras need time after power-on)
+        print(f"[I2C] Waiting for camera boot...")
+        time.sleep(1.0)
+        
+        # Test I2C communication
         print(f"[I2C] Testing communication...")
         cci_wait_busy()
         
-        # Try to read status register
+        # Read status register
         status = cci_read_register(CCI_STATUS_REG)
         if status is not None:
-            print(f"[I2C] Camera status: 0x{status:04X}")
-            print(f"[I2C] I2C communication OK")
+            print(f"[I2C] Camera status register: 0x{status:04X}")
+            busy = status & 0x01
+            boot_mode = (status >> 2) & 0x01
+            boot_status = (status >> 3) & 0x01
+            print(f"[I2C]   Busy: {busy}")
+            print(f"[I2C]   Boot mode: {boot_mode}")
+            print(f"[I2C]   Boot status: {boot_status}")
+            
+            # Status 0x0000 might mean camera is ready but hasn't been configured
+            # This is actually okay - camera responds to I2C
+            print(f"[I2C] I2C communication established")
+            
+            # Camera should start streaming by default after boot
+            # If not, we may need to send specific enable commands
+            # For now, let's proceed and see what SPI gives us
+            
             return True
         else:
             print(f"[I2C] Failed to read camera status")
@@ -134,8 +152,17 @@ spi.mode = 3
 print(f"[INIT] SPI configured: speed={SPI_SPEED} Hz, mode={spi.mode}")
 
 # Wait for camera initialization
-print(f"[INIT] Waiting 3 seconds for camera initialization...")
-time.sleep(3)
+print(f"[INIT] Waiting 5 seconds for camera full initialization...")
+time.sleep(5)
+
+print(f"[INIT] Performing VoSPI synchronization...")
+# Proper VoSPI sync: deassert CS for at least 185ms (5 frame periods)
+spi.close()
+time.sleep(0.200)  # 200ms to be safe
+spi.open(SPI_BUS, SPI_DEVICE)
+spi.max_speed_hz = SPI_SPEED
+spi.mode = 3
+print(f"[INIT] VoSPI sync complete, SPI ready")
 
 print(f"[INIT] Running packet analysis...")
 
@@ -150,6 +177,7 @@ def analyze_packets(num_packets=200):
     packet_numbers = []
     segment_numbers = []
     discard_packets = 0
+    invalid_segment_zero = 0
     
     for i in range(num_packets):
         packet = read_packet()
@@ -164,12 +192,16 @@ def analyze_packets(num_packets=200):
             discard_packets += 1
         else:
             segment_num = (header >> 4)
-            segment_numbers.append(segment_num)
+            if segment_num == 0:
+                invalid_segment_zero += 1
+            else:
+                segment_numbers.append(segment_num)
     
     # Analysis
     print(f"[DIAG] Results from {num_packets} packets:")
-    print(f"[DIAG]   Discard packets: {discard_packets} ({100*discard_packets/num_packets:.1f}%)")
-    print(f"[DIAG]   Valid packets: {num_packets - discard_packets}")
+    print(f"[DIAG]   Discard packets (0xFF): {discard_packets} ({100*discard_packets/num_packets:.1f}%)")
+    print(f"[DIAG]   Invalid segment #0: {invalid_segment_zero} ({100*invalid_segment_zero/num_packets:.1f}%)")
+    print(f"[DIAG]   Valid packets: {len(segment_numbers)}")
     
     # Show unique header bytes (first 10)
     unique_headers = Counter(header_bytes).most_common(10)
@@ -178,17 +210,23 @@ def analyze_packets(num_packets=200):
         print(f"[DIAG]     0x{header:02X}: {count} times ({100*count/num_packets:.1f}%)")
     
     if segment_numbers:
-        print(f"[DIAG]   Segments seen: {sorted(set(segment_numbers))}")
+        print(f"[DIAG]   Valid segments seen: {sorted(set(segment_numbers))}")
         print(f"[DIAG]   Packet number range: {min(packet_numbers)}-{max(packet_numbers)}")
     else:
         print(f"[DIAG]   WARNING: No valid segments detected!")
-        print(f"[DIAG]   This indicates VoSPI sync issues or camera not initialized")
+        if invalid_segment_zero > 0:
+            print(f"[DIAG]   Camera is streaming but marking all segments as invalid (segment #0)")
+            print(f"[DIAG]   This may indicate:")
+            print(f"[DIAG]     - VoSPI out of sync (need to wait for valid frame)")
+            print(f"[DIAG]     - Camera still initializing")
+            print(f"[DIAG]     - Duplicate/invalid frame period (Lepton sends 2 invalid frames per valid frame)")
+        elif discard_packets == num_packets:
+            print(f"[DIAG]   Camera sending only discard packets (not streaming yet)")
+        else:
+            print(f"[DIAG]   Unknown packet pattern")
     
-    # Check for pattern
-    if discard_packets == num_packets:
-        print(f"[DIAG]   PROBLEM: 100% discard packets - camera out of sync or not streaming")
-    
-    return discard_packets < num_packets
+    # Consider segment 0 packets as a sign of partial communication
+    return (discard_packets < num_packets) or (invalid_segment_zero > 0)
 
 def resync_vospi(attempt=1):
     """Attempt to resynchronize VoSPI by cycling the SPI connection"""
@@ -236,16 +274,30 @@ if not analyze_packets(200):
 print(f"\n[INIT] Starting frame capture loop...")
 
 def get_frame():
-    """Capture a complete frame with automatic resync on excessive discards"""
+    """Capture a complete frame with automatic resync on excessive discards
+    
+    The Lepton sends frames in this pattern:
+    - 1 valid frame (segments 1,2,3,4)
+    - 2 invalid frames (segment 0)
+    We need to skip the invalid frames and wait for a valid one.
+    """
     frame = np.zeros((120, 160), dtype=np.uint16)
     segments_received = set()
     packet_count = 0
     discard_count = 0
     invalid_segment_count = 0
+    segment_zero_count = 0
     start_time = time.time()
     resync_triggered = False
+    
+    print(f"[FRAME] Waiting for valid frame (skipping invalid segment #0 frames)...")
 
     while len(segments_received) < 4:
+        # Timeout check (60 seconds max for a frame)
+        if time.time() - start_time > 60:
+            print(f"[FRAME] ERROR: Timeout waiting for frame (60s)")
+            break
+            
         # Check if we need to resync
         if discard_count > MAX_DISCARD_BEFORE_RESYNC and not resync_triggered:
             print(f"[FRAME] Too many discards ({discard_count}), triggering resync...")
@@ -254,16 +306,17 @@ def get_frame():
             discard_count = 0
             packet_count = 0
             segments_received.clear()
+            segment_zero_count = 0
             continue
         
         packet = read_packet()
         packet_count += 1
 
-        # Debug first few packets
-        if packet_count <= 5:
-            print(f"[FRAME] Packet {packet_count}: header=0x{packet[0]:02X}, byte1=0x{packet[1]:02X}, byte2=0x{packet[2]:02X}, byte3=0x{packet[3]:02X}")
+        # Debug first few packets of each frame attempt
+        if packet_count <= 3:
+            print(f"[FRAME] Packet {packet_count}: header=0x{packet[0]:02X}, byte1=0x{packet[1]:02X}")
 
-        # Discard packets
+        # Discard packets (0xFF)
         if (packet[0] & 0x0F) == 0x0F:
             discard_count += 1
             if discard_count % 100 == 0:
@@ -273,15 +326,27 @@ def get_frame():
         packet_number = packet[1]
         segment_number = (packet[0] >> 4)
 
+        # Invalid segment 0 - this is normal between valid frames
+        if segment_number == 0:
+            segment_zero_count += 1
+            # After seeing many segment 0 packets, wait for next segment
+            if segment_zero_count == 60:  # One full segment of zeros
+                print(f"[FRAME] Completed invalid frame (segment #0), waiting for next frame...")
+                segments_received.clear()  # Reset for next frame
+                segment_zero_count = 0
+            continue
+        
+        # Invalid segment number (not 0, 1, 2, 3, or 4)
         if segment_number < 1 or segment_number > 4:
             invalid_segment_count += 1
             if invalid_segment_count % 50 == 0:
-                print(f"[FRAME] Invalid segment #{segment_number} from header 0x{packet[0]:02X} (count: {invalid_segment_count})")
+                print(f"[FRAME] Unexpected segment #{segment_number} (count: {invalid_segment_count})")
             continue
 
+        # Valid segment! (1-4)
         if segment_number not in segments_received:
             segments_received.add(segment_number)
-            print(f"[FRAME] Received segment {segment_number}/4 (packets read: {packet_count})")
+            print(f"[FRAME] ✓ Received valid segment {segment_number}/4")
 
         row = (segment_number - 1) * 30 + packet_number
         data = np.frombuffer(packet[4:], dtype=">u2")
@@ -290,7 +355,8 @@ def get_frame():
             frame[row] = data
 
     elapsed = time.time() - start_time
-    print(f"[FRAME] Complete! Time: {elapsed:.2f}s, Packets: {packet_count}, Discarded: {discard_count}, Invalid: {invalid_segment_count}")
+    print(f"[FRAME] Complete! Time: {elapsed:.2f}s, Total packets: {packet_count}")
+    print(f"[FRAME]   Discarded: {discard_count}, Invalid seg#0: {segment_zero_count}, Other invalid: {invalid_segment_count}")
     
     if resync_triggered:
         print(f"[FRAME] Note: Frame required VoSPI resync")

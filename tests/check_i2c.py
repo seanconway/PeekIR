@@ -12,7 +12,7 @@ except ImportError:
     print("ERROR: smbus2 not installed. Run: uv pip install smbus2")
     sys.exit(1)
 
-I2C_BUS = 10
+I2C_BUS = 1  # Standard Raspberry Pi I2C bus
 LEPTON_ADDRESS = 0x2A
 
 print(f"Lepton Camera I2C Diagnostic")
