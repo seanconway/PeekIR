@@ -3,6 +3,7 @@ from ultralytics import YOLO
 import cv2, time, os, re, glob, json
 from datetime import datetime
 import numpy as np
+from pathlib import Path
 
 # Package installs
     # sudo apt update
@@ -21,7 +22,8 @@ import numpy as np
     # source ~/yolo-env/bin/activate && python3 /home/corban/Documents/GitHub/SafeHaven/SoftwareDemo/PiCamera/PiCameraAI.py
 
 # Download from: https://github.com/lindevs/yolov8-face?tab=readme-ov-file
-DefaultModelPath = "yolov8n-face.pt" # Path to model
+OUTPUT_DIR = Path(__file__).resolve().parent
+DefaultModelPath = OUTPUT_DIR / "yolov8n-face.pt"  # Path to model
 #DefaultModelPath = "yolov8-lite-t.pt" # Path to model
                                 # You can try "yolo11n.pt" if is available
                                 # You can increase speed by setting image size to 480 or 419
@@ -34,10 +36,10 @@ MotorMaxMM = 636
 
 def SnapshotIndex():
     # Scan current directory and return next Snapshot_{n} index
-    existing = glob.glob("Snapshot_*.jpg")
+    existing = OUTPUT_DIR.glob("Snapshot_*.jpg")
     max_n = 0
     for f in existing:
-        m = re.match(r"Snapshot_(\d+)_", os.path.basename(f))
+        m = re.match(r"Snapshot_(\d+)_", f.name)
         if m:
             try:
                 max_n = max(max_n, int(m.group(1)))
@@ -150,7 +152,7 @@ def PersonCapture(
                 }
 
                 try:
-                    with open("faceposition.json", "w") as f:
+                    with open(OUTPUT_DIR / "faceposition.json", "w") as f:
                         json.dump(face_data, f, indent=4)
                 except IOError as e:
                     print(f"Error writing to faceposition.json: {e}")
@@ -207,11 +209,11 @@ def PersonCapture(
                 idx = SnapshotIndex()
                 ts = datetime.now()
                 base = f"Snapshot_{idx:04d}_{ts:%Y-%m-%d_%H-%M-%S}"
-                img_path  = f"{base}.jpg"
-                meta_path = f"{base}.json"  # distinct from box_coords.json
+                img_path = OUTPUT_DIR / f"{base}.jpg"
+                meta_path = OUTPUT_DIR / f"{base}.json"  # distinct from box_coords.json
 
                 # Save image
-                cv2.imwrite(img_path, annotated)
+                cv2.imwrite(str(img_path), annotated)
 
                 # Save metadata for this snapshot
                 snapshot_meta = {
@@ -256,7 +258,7 @@ def PersonCapture(
                     "timestamp": time.time()
                 }
 
-                with open("faceposition.json", "w") as f:
+                with open(OUTPUT_DIR / "faceposition.json", "w") as f:
                     json.dump(face_data, f, indent=4)
 
                 # with open("box_coords.json", "w") as f:

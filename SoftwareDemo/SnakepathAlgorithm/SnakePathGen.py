@@ -8,6 +8,7 @@ import numpy as np
 import json
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
 from typing import Tuple, List
 
 # Activate virtual environment
@@ -19,14 +20,8 @@ from typing import Tuple, List
 # One line command
     # source ~/yolo-env/bin/activate && python3 SoftwareDemo/SnakePathAlgorithm.py
 
-# Box corner coordinate path on RP5
-BOX_JSON = "/home/corban/Documents/GitHub/SafeHaven/SoftwareDemo/PiCamera/box_coords.json"
-
-# Read/write file in the same working directory as main.py
-# BOX_JSON = "box_coords.json"
-
-# Box corner coordinate path on github
-# BOX_JSON = r"C:\GitHub\SafeHaven\SoftwareDemo\PiCamera\box_coords.json"
+# Box corner coordinate path (relative to SoftwareDemo/PiCamera)
+BOX_JSON = str((Path(__file__).resolve().parents[1] / "PiCamera" / "box_coords.json"))
 
 # Image size (640x480)
 IMG_W, IMG_H = 640, 480

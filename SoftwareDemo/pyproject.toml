@@ -10,6 +10,7 @@ dependencies = [
     "pynput",
     "ultralytics",
     "gpiozero",
+    "requests",
 ]
 
 #[build-system]

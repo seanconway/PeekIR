@@ -3,6 +3,9 @@ from ultralytics import YOLO
 import cv2, time, os, re, glob, json
 from datetime import datetime
 import numpy as np
+from pathlib import Path
+import sys
+import tempfile
 
 # Package installs
     # sudo apt update
@@ -38,7 +41,8 @@ import numpy as np
 #         * does NOT write any files
 
 
-DefaultModelPath = "yolov8n.pt" # Path to model
+OUTPUT_DIR = Path(__file__).resolve().parent
+DefaultModelPath = OUTPUT_DIR / "yolov8n.pt"  # Path to model
                                 # You can try "yolo11n.pt" if is available
                                 # You can increase speed by setting image size to 480 or 419
 
@@ -46,15 +50,26 @@ DefaultWidth, DefaultHeight = 640, 480  # Set camera resolution (lower res = mor
                                         # Camera native resolution is 12MP = 4608 x 2592
                                         # Lower camera resolution to 1080p to save resources and output more frames
 
-DefaultWeaponModelPath = "weapons_yolov8n.pt"   # Path to RoboFlow weapon model
+CAPSTONE_ROOT = Path(__file__).resolve().parents[3] / "CapstoneProject"
+if CAPSTONE_ROOT.exists():
+    sys.path.insert(0, str(CAPSTONE_ROOT))
+
+try:
+    from backend.scripts.gunDetect import detect_weapons, DEFAULT_WEIGHTS_PATH as CAPSTONE_WEIGHTS
+except Exception as e:
+    raise RuntimeError(
+        "Unable to import Capstone gunDetect. Ensure CapstoneProject is available and on PYTHONPATH."
+    ) from e
+
+DefaultWeaponModelPath = Path(os.getenv("WEAPON_MODEL_PATH", str(CAPSTONE_WEIGHTS)))
 
 # Check if snapshot name exist and increment snapshot #
 def SnapshotIndex():
     # Scan current directory and return next Snapshot_{n} index
-    existing = glob.glob("Snapshot_*.jpg")
+    existing = OUTPUT_DIR.glob("Snapshot_*.jpg")
     max_n = 0
     for f in existing:
-        m = re.match(r"Snapshot_(\d+)_", os.path.basename(f))
+        m = re.match(r"Snapshot_(\d+)_", f.name)
         if m:
             try:
                 max_n = max(max_n, int(m.group(1)))
@@ -68,22 +83,16 @@ def ScanPersonAndWeapon(
     width: int = DefaultWidth,
     height: int = DefaultHeight,
     window_name: str = "Person + Weapon Scan (Press S=capture, Q=quit)",
-    weapon_class_names=None,
     person_class_names=None,
     conf_thresh_person: float = 0.35,
     conf_thresh_weapon: float = 0.4,
 ):
-    if weapon_class_names is None:
-        # TODO: replace with your actual Roboflow class names
-        weapon_class_names = {"gun", "knife", "pistol", "rifle", "weapon"}
-
     if person_class_names is None:
         # For yolov8n 'person' class id = 0
         person_class_names = {"person"}
 
-    # Load models
+    # Load person model
     person_model = YOLO(person_model_path)
-    weapon_model = YOLO(weapon_model_path)
 
     # Set up camera
     picam2 = Picamera2()
@@ -150,54 +159,50 @@ def ScanPersonAndWeapon(
                             cv2.LINE_AA,
                         )
 
-            # ---------- Weapon detection (Roboflow model) ----------
-            weapon_results = weapon_model.predict(
-                source=frame,
-                imgsz=480,
-                device="cpu",
-                conf=conf_thresh_weapon,
-                iou=0.45,
-                verbose=False,
-            )
-            wr = weapon_results[0]
-
+            # ---------- Weapon detection (Capstone gunDetect) ----------
             weapon_dets = []
             weapon_found = False
-
-            if wr.boxes is not None and len(wr.boxes) > 0:
-                boxes = wr.boxes
-                xyxy = boxes.xyxy.detach().cpu().numpy()
-                confs = boxes.conf.detach().cpu().numpy()
-                clss = boxes.cls.detach().cpu().numpy().astype(int)
-                names = getattr(wr, "names", None) or getattr(weapon_model, "names", {})
-
-                for i, cls_id in enumerate(clss):
-                    cls_name = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else str(cls_id)
-                    conf = float(confs[i])
-
-                    if cls_name in weapon_class_names and conf >= conf_thresh_weapon:
-                        weapon_found = True
-                        x1, y1, x2, y2 = xyxy[i].astype(int)
-                        weapon_dets.append(
-                            {
-                                "cls_id": int(cls_id),
-                                "cls_name": cls_name,
-                                "conf": conf,
-                                "xyxy": [int(x1), int(y1), int(x2), int(y2)],
-                            }
-                        )
-                        # Draw red box for weapon
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                        cv2.putText(
-                            annotated,
-                            f"{cls_name} {conf:.2f}",
-                            (x1, max(0, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 0, 255),
-                            1,
-                            cv2.LINE_AA,
-                        )
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    tmp_path = tmp.name
+                bgr = frame[..., ::-1]
+                cv2.imwrite(tmp_path, bgr)
+                has_gun, dets, _ = detect_weapons(
+                    tmp_path,
+                    weights_path=weapon_model_path,
+                    conf_threshold=conf_thresh_weapon,
+                )
+                weapon_found = bool(has_gun)
+                for d in dets:
+                    if not d.xyxy:
+                        continue
+                    x1, y1, x2, y2 = [int(v) for v in d.xyxy]
+                    weapon_dets.append(
+                        {
+                            "cls_id": int(d.class_id),
+                            "cls_name": str(d.label),
+                            "conf": float(d.confidence),
+                            "xyxy": [x1, y1, x2, y2],
+                        }
+                    )
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(
+                        annotated,
+                        f"{d.label} {d.confidence:.2f}",
+                        (x1, max(0, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 0, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+            finally:
+                if tmp_path:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
             # ---------- FPS + HUD ----------
             now = time.time()
@@ -288,11 +293,11 @@ def ScanPersonAndWeapon(
                 idx = SnapshotIndex()
                 ts = datetime.now()
                 base = f"Snapshot_{idx:04d}_{ts:%Y-%m-%d_%H-%M-%S}"
-                img_path = f"{base}.jpg"
-                meta_path = f"{base}.json"
+                img_path = OUTPUT_DIR / f"{base}.jpg"
+                meta_path = OUTPUT_DIR / f"{base}.json"
 
                 # Save image (current annotated frame)
-                cv2.imwrite(img_path, annotated)
+                cv2.imwrite(str(img_path), annotated)
 
                 # Save metadata
                 snapshot_meta = {
@@ -307,7 +312,7 @@ def ScanPersonAndWeapon(
                     json.dump(snapshot_meta, f, indent=2)
 
                 # Overwrite latest coordinate file
-                with open("box_coords.json", "w") as f:
+                with open(OUTPUT_DIR / "box_coords.json", "w") as f:
                     json.dump(
                         {
                             "datetime_local": snapshot_meta["datetime_local"],

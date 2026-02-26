@@ -42,6 +42,7 @@ Purpose: Capture frames from the camera (PiCamera) and run object detection (YOL
 - Outputs: bounding boxes, class labels, timestamps (written to stdout, logs, or passed to orchestrator).
 - Typical files:
   - `SoftwareDemo/PiCamera/HeadlessPersonTracker.py`
+  - `SoftwareDemo/PiCamera/PiOffloadClient.py` (offloads detection to Capstone backend)
   - `BoundaryBoxDetect/BoundaryBoxDetect.py`
 
 - How to run (example):
@@ -233,6 +234,9 @@ For each agent keep the contract tiny and explicit (inputs, outputs, error modes
 
 ## Contact & Ownership
 If you modify an agent, update `AGENTS.md` to describe any changed runtime behavior. Add a small changelog entry in the file (date + short note) so future contributors quickly see the evolution.
+
+## Changelog
+- 2026-02-25: Added Pi offload client for camera capture + remote inference, updated camera agent paths, and aligned detection outputs with Capstone backend.
 
 
 ---

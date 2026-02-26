@@ -5,11 +5,13 @@ import os
 import numpy as np
 import sys
 import json
+from pathlib import Path
 
 # Configuration
-ModelPath = "yolov8n-face.pt"
+OUTPUT_DIR = Path(__file__).resolve().parent
+ModelPath = str(OUTPUT_DIR / "yolov8n-face.pt")
 Width, Height = 640, 480
-OutputParamsFile = "faceposition.json"
+OutputParamsFile = str(OUTPUT_DIR / "faceposition.json")
 MotorMaxMM = 636
 SmoothingFactor = 0.15 # Controls smoothness (0.0 to 1.0). Lower = smoother but more lag.
 
