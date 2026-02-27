@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
 """
-FLIR Lepton (VoSPI) one-frame capture with HARD debugging.
+Lepton VoSPI debug capture (single frame) with strong failure localization.
 
-Designed to answer, conclusively:
-- Are we receiving valid VoSPI packets?
-- Are we seeing a sane packet counter?
-- Are we seeing segmented stream (Lepton 3.x: segments 1..4)?
-- Can we lock to a frame boundary (seg=1, pkt=0) and collect a full frame?
-- If not, WHERE does it fail (with clear prints + a final failure summary).
+Key additions vs prior script:
+- Uses spidev xfer2(..., delay_usecs=DELAY_US) to enforce CS idle gap
+- Detects and reports:
+   * "ALL_DISCARD" (never saw a valid packet)
+   * "STUCK_HEADER" (same header repeating -> CS framing/MISO issue)
+   * "INVALID_SEGMENT_DOMINANT" (seg=15 etc)
+- Dumps raw first 8 bytes of recent packets for electrical sanity checks
 
-Works with Raspberry Pi spidev (e.g., /dev/spidev0.0), mode 3.
-
-Outputs:
-- frame.pgm (16-bit PGM) on success
-- debug logs always
-
-USAGE EXAMPLES:
-  python3 lepton_debug_capture.py
-  python3 lepton_debug_capture.py --hz 2000000 --timeout 8 --verbose
-  python3 lepton_debug_capture.py --device 0.0 --out frame.pgm
-
-NOTE:
-- If you have Lepton 2.x (80x60), this script will detect "mostly segment=0" and will
-  automatically fall back to a 1-segment capture mode (80x60).
+Try in this order:
+  python3 lepton_vospi_debug.py --hz 2000000 --delay-us 20 --timeout 10 --verbose
+  python3 lepton_vospi_debug.py --hz 1000000 --delay-us 50 --timeout 12 --verbose
 """
 
 import argparse
@@ -34,22 +24,19 @@ from typing import Dict, List, Optional, Tuple
 try:
     import spidev
 except ImportError:
-    print("ERROR: spidev not installed. On Raspberry Pi OS: sudo apt install -y python3-spidev", file=sys.stderr)
+    print("ERROR: spidev not installed. sudo apt install -y python3-spidev", file=sys.stderr)
     sys.exit(2)
 
 try:
     import numpy as np
 except ImportError:
-    print("ERROR: numpy not installed. Install: sudo apt install -y python3-numpy", file=sys.stderr)
+    print("ERROR: numpy not installed. sudo apt install -y python3-numpy", file=sys.stderr)
     sys.exit(2)
 
 
-# VoSPI constants
-PACKET_SIZE = 164          # bytes per VoSPI packet (header+payload)
-HEADER_SIZE = 4            # bytes: 2 for ID + 2 for CRC or reserved depending on module
-INVALID_PKT_NUM = 0x0FFF   # lower 12 bits all ones => discard
-DEFAULT_HZ = 4_000_000
-DEFAULT_SPI_MODE = 0b11    # mode 3
+PACKET_SIZE = 164
+HEADER_SIZE = 4
+INVALID_PKT_NUM = 0x0FFF  # lower 12 bits all ones => discard in many Lepton VoSPI stacks
 
 
 def now_ms() -> int:
@@ -57,220 +44,159 @@ def now_ms() -> int:
 
 
 def parse_packet_id(pkt: List[int]) -> Tuple[int, int, int]:
-    """
-    Returns (raw_id, segment, packet_num).
-    raw_id: 16-bit word formed from first 2 bytes.
-    segment: upper 4 bits (0..15)
-    packet_num: lower 12 bits (0..4095)
-    """
     raw_id = (pkt[0] << 8) | pkt[1]
-    segment = (raw_id >> 12) & 0xF
-    packet_num = raw_id & 0x0FFF
-    return raw_id, segment, packet_num
+    seg = (raw_id >> 12) & 0xF
+    pnum = raw_id & 0x0FFF
+    return raw_id, seg, pnum
 
 
 def is_discard(raw_id: int) -> bool:
     return (raw_id & 0x0FFF) == INVALID_PKT_NUM
 
 
-def hexdump_ids(id_history: collections.deque) -> str:
-    # Each entry: (t_ms, raw_id, seg, pkt)
-    out = []
-    for t_ms, raw_id, seg, pkt in list(id_history)[-20:]:
-        out.append(f"{t_ms:>8}ms  id=0x{raw_id:04X}  seg={seg:>2}  pkt={pkt:>4}")
-    return "\n".join(out) if out else "(none)"
-
-
-def open_spi(bus: int, dev: int, hz: int, mode: int, verbose: bool) -> "spidev.SpiDev":
+def open_spi(bus: int, dev: int, hz: int, mode: int) -> "spidev.SpiDev":
     spi = spidev.SpiDev()
     spi.open(bus, dev)
     spi.max_speed_hz = hz
     spi.mode = mode
-    # bits_per_word is usually 8 by default; we keep it.
-    if verbose:
-        print(f"[SPI] Opened /dev/spidev{bus}.{dev}  mode={mode} (0b{mode:02b})  hz={hz}")
     return spi
 
 
-def read_packet(spi: "spidev.SpiDev") -> List[int]:
-    # Full-duplex read: clock out zeros to read PACKET_SIZE bytes.
-    return spi.xfer2([0] * PACKET_SIZE)
+def read_packet(spi: "spidev.SpiDev", delay_us: int) -> List[int]:
+    # xfer2 args: data, speed_hz=0, delay_usecs=0, bits_per_word=0
+    return spi.xfer2([0] * PACKET_SIZE, 0, delay_us, 0)
 
 
-def detect_stream_type(spi: "spidev.SpiDev", probe_packets: int, verbose: bool) -> Dict:
-    """
-    Probe the stream for a short window and infer:
-    - do we see mostly segment 1..4? (Lepton 3.x)
-    - do we see mostly segment 0? (often Lepton 2.x behavior in practice)
-    - do packet numbers look like 0..59 patterns?
-    - how many discards?
-    """
+def dump_recent(id_history: collections.deque) -> str:
+    # entries: (t_ms, raw_id, seg, pnum, first8bytes)
+    lines = []
+    for t_ms, raw_id, seg, pnum, first8 in list(id_history)[-20:]:
+        fb = " ".join(f"{b:02X}" for b in first8)
+        lines.append(f"{t_ms:>8}ms  id=0x{raw_id:04X} seg={seg:>2} pkt={pnum:>4}  hdr8=[{fb}]")
+    return "\n".join(lines) if lines else "(none)"
+
+
+def probe(spi, delay_us: int, n: int) -> Dict:
     seg_counts = collections.Counter()
-    pkt_counts = collections.Counter()
-    discard = 0
+    pnum_counts = collections.Counter()
+    rawid_counts = collections.Counter()
+    discards = 0
     ok = 0
-    id_history = collections.deque(maxlen=200)
+    id_history = collections.deque(maxlen=400)
 
     t0 = now_ms()
-    for _ in range(probe_packets):
-        pkt = read_packet(spi)
+    for _ in range(n):
+        pkt = read_packet(spi, delay_us)
         raw_id, seg, pnum = parse_packet_id(pkt)
-        id_history.append((now_ms() - t0, raw_id, seg, pnum))
+        first8 = pkt[:8]
+        id_history.append((now_ms() - t0, raw_id, seg, pnum, first8))
+
+        rawid_counts[raw_id] += 1
+
         if is_discard(raw_id):
-            discard += 1
+            discards += 1
             continue
+
         ok += 1
         seg_counts[seg] += 1
-        pkt_counts[pnum] += 1
+        pnum_counts[pnum] += 1
 
-    # Heuristic inference
-    seg_1234 = sum(seg_counts[s] for s in (1, 2, 3, 4))
-    seg_0 = seg_counts[0]
-    total_ok = max(ok, 1)
+    # Determine if header is "stuck" (top raw_id repeats overwhelmingly)
+    most_common_rawid, mc_count = rawid_counts.most_common(1)[0]
+    stuck_ratio = mc_count / max(n, 1)
 
-    if seg_1234 / total_ok > 0.70:
-        stream = "SEGMENTED_4"   # Lepton 3.x-style
-    elif seg_0 / total_ok > 0.70:
-        stream = "SINGLE_SEG"    # likely Lepton 2.x-style (or segmented field not used)
-    else:
-        stream = "MIXED/UNKNOWN"
+    pkt_0_59 = sum(pnum_counts[i] for i in range(60))
+    pkt_0_59_ratio = pkt_0_59 / max(ok, 1)
 
-    # Packet numbers: see if 0..59 appear frequently
-    pkt_0_59 = sum(pkt_counts[i] for i in range(60))
-    pkt_0_59_ratio = pkt_0_59 / total_ok
-
-    result = {
-        "stream": stream,
+    return {
         "ok": ok,
-        "discard": discard,
+        "discards": discards,
         "seg_counts": seg_counts,
-        "pkt_0_59_ratio": pkt_0_59_ratio,
+        "pnum_0_59_ratio": pkt_0_59_ratio,
+        "most_common_rawid": most_common_rawid,
+        "stuck_ratio": stuck_ratio,
         "id_history": id_history,
     }
 
-    if verbose:
-        print("[PROBE] Results:")
-        print(f"  ok_packets={ok}  discarded={discard}")
-        print(f"  segment_counts={dict(seg_counts)}")
-        print(f"  pkt(0..59)_ratio={pkt_0_59_ratio:.2f}")
-        print(f"  inferred_stream={stream}")
-        if stream == "MIXED/UNKNOWN":
-            print("  [PROBE WARN] Segment field not strongly consistent. This can happen if you're sampling mid-chaos or wiring/timing is bad.")
-        print("  Last packet headers seen (most recent last):")
-        print(hexdump_ids(id_history))
 
-    return result
+def write_pgm_u16(path: str, frame_u16: np.ndarray) -> None:
+    h, w = frame_u16.shape
+    with open(path, "wb") as f:
+        f.write(f"P5\n{w} {h}\n65535\n".encode("ascii"))
+        frame_u16.astype(np.uint16).byteswap().tofile(f)
 
 
-def wait_for_frame_start_segmented(
-    spi: "spidev.SpiDev",
-    timeout_s: float,
-    verbose: bool,
-) -> Tuple[bool, str, collections.deque]:
+def capture_segmented_160x120(spi, delay_us: int, timeout_s: float, verbose: bool):
     """
-    For 4-segment mode:
-    Wait until we see seg=1, pkt=0 (start of a frame boundary).
-    """
-    id_history = collections.deque(maxlen=500)
-    t0 = time.monotonic()
-    base_ms = now_ms()
-
-    while (time.monotonic() - t0) < timeout_s:
-        pkt = read_packet(spi)
-        raw_id, seg, pnum = parse_packet_id(pkt)
-        id_history.append((now_ms() - base_ms, raw_id, seg, pnum))
-
-        if is_discard(raw_id):
-            continue
-
-        if seg == 1 and pnum == 0:
-            if verbose:
-                print(f"[SYNC] Locked to frame start: seg=1 pkt=0 (id=0x{raw_id:04X})")
-            return True, "OK", id_history
-
-    return False, "TIMEOUT_WAITING_FOR_SEG1_PKT0", id_history
-
-
-def capture_one_frame_segmented(
-    spi: "spidev.SpiDev",
-    timeout_s: float,
-    verbose: bool,
-) -> Tuple[Optional[np.ndarray], str, Dict, collections.deque]:
-    """
-    Capture one 160x120 frame for Lepton 3.x (4 segments, 60 packets each).
-    Returns (frame_or_none, status, stats, id_history).
+    4 segments x 60 packets = 240 total
     """
     id_history = collections.deque(maxlen=2000)
     stats = {
         "discards": 0,
-        "packets_kept": 0,
-        "bad_order": 0,
+        "kept": 0,
+        "invalid_seg": 0,
+        "bad_pnum": 0,
         "duplicate": 0,
+        "seg_fill": {1: 0, 2: 0, 3: 0, 4: 0},
         "missing": [],
-        "seg_complete": {1: 0, 2: 0, 3: 0, 4: 0},
     }
 
-    ok, reason, sync_history = wait_for_frame_start_segmented(spi, timeout_s, verbose)
-    id_history.extend(sync_history)
-    if not ok:
-        return None, reason, stats, id_history
-
-    # Store raw packets payloads by [seg][pnum]
-    seg_packets: Dict[int, List[Optional[bytes]]] = {1: [None]*60, 2: [None]*60, 3: [None]*60, 4: [None]*60}
-
-    start = time.monotonic()
+    # Sync: wait for seg=1 pkt=0
+    t0 = time.monotonic()
     base_ms = now_ms()
-    # We already consumed seg=1 pkt=0 in sync stage; store it by re-reading? No—sync stage already read it but didn't keep payload.
-    # Easiest: after sync, continue and accept that we might have missed that exact packet; we will keep reading until all 240 are filled.
-    # This is robust because we're already aligned to the boundary.
-    if verbose:
-        print("[CAPTURE] Collecting 4 segments × 60 packets...")
-
-    last_seen = {1: -1, 2: -1, 3: -1, 4: -1}
-    while (time.monotonic() - start) < timeout_s:
-        pkt = read_packet(spi)
+    synced = False
+    while time.monotonic() - t0 < timeout_s:
+        pkt = read_packet(spi, delay_us)
         raw_id, seg, pnum = parse_packet_id(pkt)
-        id_history.append((now_ms() - base_ms, raw_id, seg, pnum))
+        id_history.append((now_ms() - base_ms, raw_id, seg, pnum, pkt[:8]))
+
+        if is_discard(raw_id):
+            stats["discards"] += 1
+            continue
+
+        if seg == 1 and pnum == 0:
+            synced = True
+            if verbose:
+                print(f"[SYNC] seg=1 pkt=0 id=0x{raw_id:04X}")
+            break
+
+    if not synced:
+        return None, "TIMEOUT_SYNC_SEG1_PKT0", stats, id_history
+
+    seg_packets = {1: [None]*60, 2: [None]*60, 3: [None]*60, 4: [None]*60}
+    t1 = time.monotonic()
+
+    while time.monotonic() - t1 < timeout_s:
+        pkt = read_packet(spi, delay_us)
+        raw_id, seg, pnum = parse_packet_id(pkt)
+        id_history.append((now_ms() - base_ms, raw_id, seg, pnum, pkt[:8]))
 
         if is_discard(raw_id):
             stats["discards"] += 1
             continue
 
         if seg not in (1, 2, 3, 4):
-            # For Lepton 3.x, seg should be 1..4. seg=0 or weird means we lost alignment or stream is not segmented.
-            # We don't immediately fail; we count as bad_order and continue until timeout.
-            stats["bad_order"] += 1
+            stats["invalid_seg"] += 1
             continue
 
         if pnum >= 60:
-            stats["bad_order"] += 1
+            stats["bad_pnum"] += 1
             continue
 
         if seg_packets[seg][pnum] is not None:
             stats["duplicate"] += 1
             continue
 
-        # Keep payload starting after 4-byte header
         seg_packets[seg][pnum] = bytes(pkt[HEADER_SIZE:])
-        stats["packets_kept"] += 1
+        stats["kept"] += 1
+        stats["seg_fill"][seg] = sum(1 for x in seg_packets[seg] if x is not None)
 
-        # Ordering hint: packet numbers should monotonically increase within a segment
-        if pnum < last_seen[seg]:
-            stats["bad_order"] += 1
-        last_seen[seg] = pnum
+        if verbose and stats["kept"] % 30 == 0:
+            print(f"[CAP] kept={stats['kept']}/240 disc={stats['discards']} invseg={stats['invalid_seg']} dup={stats['duplicate']} fill={stats['seg_fill']}")
 
-        # Update completeness counts
-        stats["seg_complete"][seg] = sum(1 for x in seg_packets[seg] if x is not None)
-
-        if verbose and (stats["packets_kept"] % 30 == 0):
-            print(f"[CAPTURE] kept={stats['packets_kept']}/240  discards={stats['discards']}  bad_order={stats['bad_order']}  dup={stats['duplicate']}  seg_fill={stats['seg_complete']}")
-
-        if stats["packets_kept"] >= 240 and all(stats["seg_complete"][s] == 60 for s in (1, 2, 3, 4)):
-            if verbose:
-                print("[CAPTURE] All segments complete.")
+        if all(stats["seg_fill"][s] == 60 for s in (1, 2, 3, 4)):
             break
 
-    # Verify completeness
     missing = []
     for s in (1, 2, 3, 4):
         for p in range(60):
@@ -279,298 +205,110 @@ def capture_one_frame_segmented(
     stats["missing"] = missing
 
     if missing:
-        # Provide a *precise* failure reason
-        if any(stats["seg_complete"][s] == 0 for s in (1, 2, 3, 4)):
-            reason = "FAILED_NO_PACKETS_IN_ONE_OR_MORE_SEGMENTS"
-        else:
-            reason = "FAILED_INCOMPLETE_FRAME_TIMEOUT"
-        return None, reason, stats, id_history
+        # More specific classification
+        if stats["invalid_seg"] > 2000 and stats["kept"] < 20:
+            return None, "INVALID_SEGMENT_DOMINANT_(CS/MISO/FRAMING)", stats, id_history
+        return None, "INCOMPLETE_FRAME_TIMEOUT", stats, id_history
 
-    # Assemble 160x120, 16-bit big-endian values per pixel
+    # Assemble
     frame = np.zeros((120, 160), dtype=np.uint16)
-
-    # For Lepton 3.x: each segment covers 30 rows; within each row: two packets (left 80, right 80)
-    # packet p: row_in_seg = p // 2, half = p % 2
-    # global_row = (seg-1)*30 + row_in_seg
     for seg in (1, 2, 3, 4):
         for p in range(60):
             payload = seg_packets[seg][p]
-            # payload length should be 160 bytes (80 pixels * 2 bytes)
             if payload is None or len(payload) != (PACKET_SIZE - HEADER_SIZE):
-                return None, f"ASSEMBLY_PAYLOAD_SIZE_MISMATCH seg={seg} pkt={p} len={0 if payload is None else len(payload)}", stats, id_history
+                return None, f"PAYLOAD_SIZE_MISMATCH seg={seg} pkt={p}", stats, id_history
 
             row_in_seg = p // 2
             half = p % 2
-            global_row = (seg - 1) * 30 + row_in_seg
+            row = (seg - 1) * 30 + row_in_seg
             col0 = 0 if half == 0 else 80
 
-            # Convert big-endian u16
-            row_pixels = np.frombuffer(payload, dtype=">u2")  # 80 values
-            if row_pixels.size != 80:
-                return None, f"ASSEMBLY_DECODE_MISMATCH seg={seg} pkt={p} values={row_pixels.size}", stats, id_history
+            vals = np.frombuffer(payload, dtype=">u2")
+            if vals.size != 80:
+                return None, f"DECODE_SIZE_MISMATCH seg={seg} pkt={p} vals={vals.size}", stats, id_history
 
-            frame[global_row, col0:col0+80] = row_pixels.astype(np.uint16)
-
-    return frame, "OK", stats, id_history
-
-
-def wait_for_frame_start_single(
-    spi: "spidev.SpiDev",
-    timeout_s: float,
-    verbose: bool,
-) -> Tuple[bool, str, collections.deque]:
-    """
-    For single-segment mode:
-    Wait until pkt=0 (and seg often 0).
-    """
-    id_history = collections.deque(maxlen=500)
-    t0 = time.monotonic()
-    base_ms = now_ms()
-
-    while (time.monotonic() - t0) < timeout_s:
-        pkt = read_packet(spi)
-        raw_id, seg, pnum = parse_packet_id(pkt)
-        id_history.append((now_ms() - base_ms, raw_id, seg, pnum))
-        if is_discard(raw_id):
-            continue
-        if pnum == 0:
-            if verbose:
-                print(f"[SYNC] Locked to frame start (single-seg): seg={seg} pkt=0 (id=0x{raw_id:04X})")
-            return True, "OK", id_history
-
-    return False, "TIMEOUT_WAITING_FOR_PKT0", id_history
-
-
-def capture_one_frame_single(
-    spi: "spidev.SpiDev",
-    timeout_s: float,
-    verbose: bool,
-) -> Tuple[Optional[np.ndarray], str, Dict, collections.deque]:
-    """
-    Capture one 80x60 frame for Lepton 2.x-ish behavior (1 segment, 60 packets).
-    (Many Lepton 2.x streams present 60 packets per frame.)
-    """
-    id_history = collections.deque(maxlen=2000)
-    stats = {
-        "discards": 0,
-        "packets_kept": 0,
-        "bad_order": 0,
-        "duplicate": 0,
-        "missing": [],
-    }
-
-    ok, reason, sync_history = wait_for_frame_start_single(spi, timeout_s, verbose)
-    id_history.extend(sync_history)
-    if not ok:
-        return None, reason, stats, id_history
-
-    packets: List[Optional[bytes]] = [None] * 60
-    start = time.monotonic()
-    base_ms = now_ms()
-    last_seen = -1
-
-    if verbose:
-        print("[CAPTURE] Collecting 1 segment × 60 packets (80x60)...")
-
-    while (time.monotonic() - start) < timeout_s:
-        pkt = read_packet(spi)
-        raw_id, seg, pnum = parse_packet_id(pkt)
-        id_history.append((now_ms() - base_ms, raw_id, seg, pnum))
-
-        if is_discard(raw_id):
-            stats["discards"] += 1
-            continue
-        if pnum >= 60:
-            stats["bad_order"] += 1
-            continue
-        if packets[pnum] is not None:
-            stats["duplicate"] += 1
-            continue
-
-        packets[pnum] = bytes(pkt[HEADER_SIZE:])
-        stats["packets_kept"] += 1
-        if pnum < last_seen:
-            stats["bad_order"] += 1
-        last_seen = pnum
-
-        if verbose and (stats["packets_kept"] % 15 == 0):
-            print(f"[CAPTURE] kept={stats['packets_kept']}/60  discards={stats['discards']}  bad_order={stats['bad_order']}  dup={stats['duplicate']}")
-
-        if stats["packets_kept"] == 60:
-            break
-
-    missing = [p for p in range(60) if packets[p] is None]
-    stats["missing"] = missing
-    if missing:
-        return None, "FAILED_INCOMPLETE_FRAME_TIMEOUT", stats, id_history
-
-    frame = np.zeros((60, 80), dtype=np.uint16)
-    for p in range(60):
-        payload = packets[p]
-        if payload is None or len(payload) != (PACKET_SIZE - HEADER_SIZE):
-            return None, f"ASSEMBLY_PAYLOAD_SIZE_MISMATCH pkt={p} len={0 if payload is None else len(payload)}", stats, id_history
-
-        row = p
-        row_pixels = np.frombuffer(payload, dtype=">u2")  # should be 80 values
-        if row_pixels.size != 80:
-            return None, f"ASSEMBLY_DECODE_MISMATCH pkt={p} values={row_pixels.size}", stats, id_history
-        frame[row, :] = row_pixels.astype(np.uint16)
+            frame[row, col0:col0+80] = vals.astype(np.uint16)
 
     return frame, "OK", stats, id_history
-
-
-def write_pgm_u16(path: str, frame_u16: np.ndarray, verbose: bool) -> None:
-    """
-    Write a 16-bit PGM (binary P5) with maxval 65535.
-    PGM expects big-endian for 16-bit; our array is host-endian, so byteswap to big-endian.
-    """
-    h, w = frame_u16.shape
-    with open(path, "wb") as f:
-        header = f"P5\n{w} {h}\n65535\n".encode("ascii")
-        f.write(header)
-        # ensure big-endian on disk
-        frame_u16.astype(np.uint16).byteswap().tofile(f)
-    if verbose:
-        print(f"[OUT] Wrote {path} ({w}x{h}, 16-bit PGM)")
-
-
-def print_failure_summary(reason: str, stats: Dict, id_history: collections.deque) -> None:
-    print("\n================ FAILURE SUMMARY ================")
-    print(f"Reason: {reason}")
-    if stats:
-        print("Stats:")
-        for k, v in stats.items():
-            if k == "missing":
-                # show only a small sample; missing can be large
-                if isinstance(v, list) and len(v) > 30:
-                    print(f"  missing: {len(v)} items (showing first 30): {v[:30]}")
-                else:
-                    print(f"  missing: {v}")
-            else:
-                print(f"  {k}: {v}")
-    print("\nLast 20 packet headers observed:")
-    print(hexdump_ids(id_history))
-    print("=================================================\n")
-
-    # Actionable next hints based on failure class
-    print("Next-step interpretation hints:")
-    if reason.startswith("TIMEOUT_WAITING_FOR_"):
-        print("- You never saw the expected frame boundary condition.")
-        print("  Common causes:")
-        print("   * wrong SPI mode (should be MODE 3)")
-        print("   * CS not toggling / wrong chip select pin")
-        print("   * too-high SPI clock or signal integrity issue")
-        print("   * Lepton not streaming (needs proper power-up / reset / I2C init depending on module)")
-    elif reason == "FAILED_NO_PACKETS_IN_ONE_OR_MORE_SEGMENTS":
-        print("- You saw some valid segment data but at least one segment never produced packets.")
-        print("  Common causes:")
-        print("   * treating Lepton 2.x as 3.x (or vice-versa)")
-        print("   * losing sync mid-frame (try lower hz, shorten wiring, ensure clean GND)")
-        print("   * CS framing issues (packet boundaries getting corrupted)")
-    elif reason == "FAILED_INCOMPLETE_FRAME_TIMEOUT":
-        print("- You started capturing but couldn't collect all required packets in time.")
-        print("  Common causes:")
-        print("   * discards too high (timing/noise)")
-        print("   * clock too fast; try --hz 2000000")
-        print("   * stream out-of-order or duplicated (CS/timing)")
-    elif reason.startswith("ASSEMBLY_"):
-        print("- Packet payload sizes/decodes are inconsistent—this usually indicates corrupted packet reads.")
-        print("  Try lowering SPI clock, shortening wires, confirming ground and level compatibility.")
-    else:
-        print("- See the header dump above; segment and packet numbers should be stable and patterned.")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="FLIR Lepton VoSPI one-frame capture with debugging.")
-    ap.add_argument("--device", default="0.0", help="spidev bus.device (default: 0.0)")
-    ap.add_argument("--hz", type=int, default=DEFAULT_HZ, help=f"SPI clock Hz (default: {DEFAULT_HZ})")
-    ap.add_argument("--mode", type=lambda x: int(x, 0), default=DEFAULT_SPI_MODE, help="SPI mode (default: 3). Accepts 3 or 0b11.")
-    ap.add_argument("--timeout", type=float, default=6.0, help="Timeout seconds per major phase (default: 6.0)")
-    ap.add_argument("--probe", type=int, default=400, help="Number of probe packets to infer stream type (default: 400)")
-    ap.add_argument("--out", default="frame.pgm", help="Output PGM path (default: frame.pgm)")
-    ap.add_argument("--verbose", action="store_true", help="More frequent progress prints")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--device", default="0.0")
+    ap.add_argument("--hz", type=int, default=2_000_000)
+    ap.add_argument("--mode", type=lambda x: int(x, 0), default=3)
+    ap.add_argument("--delay-us", type=int, default=20, help="inter-transfer delay in microseconds (default 20)")
+    ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument("--probe", type=int, default=400)
+    ap.add_argument("--out", default="frame.pgm")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    # Parse device like "0.0"
-    try:
-        bus_s, dev_s = args.device.split(".")
-        bus = int(bus_s)
-        dev = int(dev_s)
-    except Exception:
-        print("ERROR: --device must be like '0.0' or '0.1'", file=sys.stderr)
-        sys.exit(2)
+    bus_s, dev_s = args.device.split(".")
+    bus, dev = int(bus_s), int(dev_s)
 
     print("=================================================")
     print("[START] Lepton VoSPI debug capture")
     print(f"  device=/dev/spidev{bus}.{dev}")
-    print(f"  spi_mode={args.mode}  hz={args.hz}")
+    print(f"  spi_mode={args.mode}  hz={args.hz}  delay_us={args.delay_us}")
     print(f"  timeout={args.timeout}s  probe_packets={args.probe}")
     print("=================================================")
 
-    spi = None
+    spi = open_spi(bus, dev, args.hz, args.mode)
     try:
-        spi = open_spi(bus, dev, args.hz, args.mode, verbose=True)
+        print("\n[PHASE 1] Probe stream...")
+        pr = probe(spi, args.delay_us, args.probe)
 
-        print("\n[PHASE 1] Probing stream to infer Lepton type...")
-        probe = detect_stream_type(spi, args.probe, verbose=True)
-        stream = probe["stream"]
+        print("[PROBE] ok_packets=", pr["ok"], "discarded=", pr["discards"])
+        print("[PROBE] seg_counts=", dict(pr["seg_counts"]))
+        print("[PROBE] pnum(0..59)_ratio=", f"{pr['pnum_0_59_ratio']:.2f}")
+        print(f"[PROBE] most_common_rawid=0x{pr['most_common_rawid']:04X}  stuck_ratio={pr['stuck_ratio']:.2f}")
+        print("[PROBE] Recent headers:")
+        print(dump_recent(pr["id_history"]))
 
-        # If probe suggests mixed/unknown, still attempt segmented first (most likely for Lepton 3.x UWFOV),
-        # but we will clearly log the ambiguity.
-        if stream == "MIXED/UNKNOWN":
-            print("\n[WARN] Stream inference unclear; attempting SEGMENTED_4 first (common for Lepton 3.x UWFOV).")
+        if pr["ok"] == 0 and pr["discards"] == args.probe:
+            print("\n[FAIL] ALL_DISCARD: never saw a valid packet during probe.")
+            print("Most likely: camera not streaming yet OR CS/CLK framing prevents valid headers.")
+            print("Try: increase --delay-us (50), lower --hz (1000000), verify CS pin and MISO continuity.")
+            # Still attempt capture once, because sometimes sync appears only later.
 
-        # Choose capture order: segmented first unless strongly single
-        attempts = []
-        if stream == "SINGLE_SEG":
-            attempts = ["SINGLE_SEG", "SEGMENTED_4"]
-        else:
-            attempts = ["SEGMENTED_4", "SINGLE_SEG"]
+        if pr["stuck_ratio"] > 0.95:
+            print("\n[WARN] STUCK_HEADER_PROBE: one raw_id dominates the probe window.")
+            print("This strongly suggests CS framing issue or MISO not carrying real data.")
 
-        for attempt in attempts:
-            print(f"\n[PHASE 2] Attempting capture mode: {attempt}")
-            if attempt == "SEGMENTED_4":
-                frame, reason, stats, hist = capture_one_frame_segmented(spi, args.timeout, verbose=args.verbose)
-                if frame is not None:
-                    print("[SUCCESS] Captured full 160x120 frame (segmented).")
-                    write_pgm_u16(args.out, frame, verbose=True)
-                    print("[DONE] Open the PGM with eog, ImageMagick, or convert to PNG:")
-                    print(f"       convert {args.out} out.png")
-                    return 0
-                else:
-                    print_failure_summary(reason, stats, hist)
+        print("\n[PHASE 2] Capture one 160x120 segmented frame...")
+        frame, reason, stats, hist = capture_segmented_160x120(spi, args.delay_us, args.timeout, args.verbose)
+
+        if frame is None:
+            print("\n================ FAILURE SUMMARY ================")
+            print("Reason:", reason)
+            print("Stats:", stats)
+            print("\nLast 20 headers:")
+            print(dump_recent(hist))
+            print("=================================================\n")
+
+            if "INVALID_SEGMENT_DOMINANT" in reason or pr["stuck_ratio"] > 0.95:
+                print("Most probable root cause: **CS framing / chip-select behavior** or **MISO not truly connected**.")
+                print("Concrete checks:")
+                print("  1) Confirm you're using CE0/CE1 that matches your wiring (GPIO8=CE0, GPIO7=CE1).")
+                print("  2) Scope CS: it must pulse once per 164-byte transfer and go high between packets.")
+                print("  3) Add more idle: try --delay-us 50 (or 100).")
+                print("  4) Try slower clock: --hz 1000000.")
+                print("  5) Verify MISO continuity end-to-end (camera MISO -> Pi GPIO9) and common ground.")
             else:
-                frame, reason, stats, hist = capture_one_frame_single(spi, args.timeout, verbose=args.verbose)
-                if frame is not None:
-                    print("[SUCCESS] Captured full 80x60 frame (single-segment).")
-                    write_pgm_u16(args.out, frame, verbose=True)
-                    print("[DONE] Open the PGM with eog, ImageMagick, or convert to PNG:")
-                    print(f"       convert {args.out} out.png")
-                    return 0
-                else:
-                    print_failure_summary(reason, stats, hist)
+                print("Try: --hz 1000000 --delay-us 50 --timeout 12 --verbose")
+            return 1
 
-        print("[FINAL] All capture attempts failed.")
-        print("Most likely causes (ranked):")
-        print("  1) SPI signal integrity / timing (try --hz 2000000, short wires, strong GND)")
-        print("  2) CS framing issue (wrong CS pin, CS not asserted per packet)")
-        print("  3) Stream type mismatch (Lepton 2.x vs 3.x handling)")
-        print("  4) Camera not actually streaming (power/reset/I2C init path)")
-        return 1
+        print("[SUCCESS] Captured frame.")
+        write_pgm_u16(args.out, frame)
+        print(f"[OUT] Wrote {args.out} (160x120, 16-bit PGM)")
+        print("Convert/view:")
+        print(f"  convert {args.out} out.png")
+        print(f"  eog out.png")
+        return 0
 
-    except KeyboardInterrupt:
-        print("\n[ABORT] KeyboardInterrupt")
-        return 130
-    except Exception as e:
-        print("\n[ERROR] Unhandled exception:")
-        print(repr(e))
-        return 3
     finally:
-        if spi is not None:
-            try:
-                spi.close()
-            except Exception:
-                pass
+        spi.close()
 
 
 if __name__ == "__main__":
