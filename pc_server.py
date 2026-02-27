@@ -25,7 +25,14 @@ import httpx
 import numpy as np
 import cv2
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import Response, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response, StreamingResponse
+
+def _cors_allowlist() -> list[str]:
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return ["*"]
 
 REPO_ROOT = Path(__file__).resolve().parent
 CAPSTONE_ROOT = REPO_ROOT / "CapstoneProject"
@@ -39,6 +46,13 @@ from backend.scripts.personDetect import (  # type: ignore  # noqa: E402
 )
 
 app = FastAPI(title="PC Backend Server", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allowlist(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _pi_base_url() -> str:
@@ -46,6 +60,21 @@ def _pi_base_url() -> str:
     if not base:
         raise HTTPException(status_code=500, detail="PI_CAMERA_BASE_URL not set")
     return base.rstrip("/")
+
+
+def _resolve_user_path(path_value: str) -> Path:
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        candidate = (REPO_ROOT / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+
+    repo = REPO_ROOT.resolve()
+    try:
+        candidate.relative_to(repo)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Path must be within the project folder.")
+    return candidate
 
 
 @app.get("/api/health")
@@ -63,7 +92,11 @@ def camera_frame():
         raise HTTPException(status_code=502, detail=f"Pi unreachable: {e}")
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Pi error: {r.status_code}")
-    return Response(content=r.content, media_type=r.headers.get("content-type", "image/jpeg"))
+    return Response(
+        content=r.content,
+        media_type=r.headers.get("content-type", "image/jpeg"),
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/camera/stream")
@@ -94,7 +127,30 @@ async def camera_stream():
             await stream.aclose()
             await client.aclose()
 
-    return StreamingResponse(_gen(), media_type=content_type, headers={"Cache-Control": "no-store"})
+    return StreamingResponse(
+        _gen(),
+        media_type=content_type,
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/images")
+def list_images(scope: str = "repo", limit: int = 200):
+    # Minimal stub to keep frontend happy.
+    return {"scope": scope, "count": 0, "items": []}
+
+
+@app.get("/api/image")
+def get_image(path: str):
+    resolved = _resolve_user_path(path)
+    if not resolved.exists():
+        raise HTTPException(status_code=404, detail="Image not found.")
+    return FileResponse(resolved)
+
+
+@app.get("/api/logs")
+def logs(tail: int = 200):
+    return {"lines": []}
 
 
 @app.post("/api/detect-person")
