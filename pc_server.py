@@ -86,7 +86,18 @@ def _pi_base_url() -> str:
 def _resolve_user_path(path_value: str) -> Path:
     candidate = Path(path_value)
     if not candidate.is_absolute():
-        candidate = (REPO_ROOT / candidate).resolve()
+        # Try repo root first
+        repo_candidate = (REPO_ROOT / candidate).resolve()
+        if repo_candidate.exists():
+            candidate = repo_candidate
+        else:
+            # Try CapstoneProject backend relative paths
+            cap_backend_candidate = (CAPSTONE_BACKEND / candidate).resolve()
+            if cap_backend_candidate.exists():
+                candidate = cap_backend_candidate
+            else:
+                cap_candidate = (REPO_ROOT / "CapstoneProject" / candidate).resolve()
+                candidate = cap_candidate
     else:
         candidate = candidate.resolve()
 
@@ -96,6 +107,28 @@ def _resolve_user_path(path_value: str) -> Path:
     except Exception:
         raise HTTPException(status_code=400, detail="Path must be within the project folder.")
     return candidate
+
+
+def _normalize_repo_rel_path(path_value: str | None) -> str | None:
+    if not path_value:
+        return None
+    raw = Path(path_value)
+    if raw.is_absolute():
+        try:
+            return raw.resolve().relative_to(REPO_ROOT).as_posix()
+        except Exception:
+            return raw.as_posix()
+
+    # Try to resolve against repo root and CapstoneProject locations.
+    for base in (REPO_ROOT, CAPSTONE_BACKEND, REPO_ROOT / "CapstoneProject"):
+        candidate = (base / raw).resolve()
+        if candidate.exists():
+            try:
+                return candidate.relative_to(REPO_ROOT).as_posix()
+            except Exception:
+                return candidate.as_posix()
+
+    return raw.as_posix()
 
 
 def _image_suffix_from_mime(mime: str | None) -> str | None:
@@ -224,7 +257,7 @@ def _load_or_build_poi_db(enforce_detection: bool = False) -> dict[str, Any]:
             if embedding is None:
                 raise KeyError("Missing 'embedding' in DeepFace representation.")
 
-            rel = img_path.relative_to(REPO_ROOT).as_posix()
+            rel = _normalize_repo_rel_path(img_path.relative_to(REPO_ROOT).as_posix())
             entries.append(
                 {
                     "name": img_path.stem,
@@ -307,7 +340,7 @@ def _run_poi_match_bytes(data: bytes, suffix: str) -> dict[str, Any]:
             "detector_backend": POI_DETECTOR_BACKEND,
             "distance_metric": POI_DISTANCE_METRIC,
             "poi_name": best.get("name"),
-            "poi_image_path": best.get("image_path"),
+            "poi_image_path": _normalize_repo_rel_path(best.get("image_path")),
         }
     finally:
         if tmp_path and tmp_path.exists():
