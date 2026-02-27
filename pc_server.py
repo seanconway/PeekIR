@@ -12,14 +12,20 @@ Endpoints:
   GET /api/camera/frame
   GET /api/camera/stream
   POST /api/detect-person  (multipart/form-data, field name: file)
+  POST /api/poi/match       (multipart/form-data, field name: file)
+  POST /api/poi/match-base64 (JSON payload)
 """
 from __future__ import annotations
 
+import base64
+import io
+import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import numpy as np
@@ -27,6 +33,7 @@ import cv2
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 def _cors_allowlist() -> list[str]:
     raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
@@ -35,6 +42,15 @@ def _cors_allowlist() -> list[str]:
     return ["*"]
 
 REPO_ROOT = Path(__file__).resolve().parent
+CAPSTONE_BACKEND = REPO_ROOT / "CapstoneProject" / "backend"
+
+POI_DB_PATH = CAPSTONE_BACKEND / "data" / "poi_db" / "poi_embeddings.json"
+POI_DIR = CAPSTONE_BACKEND / "data" / "faces" / "poi"
+POI_MODEL_NAME = "ArcFace"
+POI_DETECTOR_BACKEND = "retinaface"
+POI_DISTANCE_METRIC = "cosine"
+POI_DEFAULT_THRESHOLD = 0.68
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 CAPSTONE_ROOT = REPO_ROOT / "CapstoneProject"
 if CAPSTONE_ROOT.exists():
     sys.path.insert(0, str(CAPSTONE_ROOT))
@@ -44,6 +60,11 @@ from backend.scripts.personDetect import (  # type: ignore  # noqa: E402
     DEFAULT_PERSON_WEIGHTS_PATH,
     CONF_THRESHOLD as DEFAULT_PERSON_CONF,
 )
+
+
+class POIMatchBase64Request(BaseModel):
+    image_base64: str = Field(..., description="Base64 or data URL for the captured suspect image.")
+    filename: str | None = Field(default=None, description="Optional filename hint for the uploaded image.")
 
 app = FastAPI(title="PC Backend Server", version="0.1.0")
 app.add_middleware(
@@ -75,6 +96,225 @@ def _resolve_user_path(path_value: str) -> Path:
     except Exception:
         raise HTTPException(status_code=400, detail="Path must be within the project folder.")
     return candidate
+
+
+def _image_suffix_from_mime(mime: str | None) -> str | None:
+    if not mime:
+        return None
+    m = mime.lower()
+    if m in {"image/jpeg", "image/jpg"}:
+        return ".jpg"
+    if m == "image/png":
+        return ".png"
+    if m == "image/webp":
+        return ".webp"
+    if m == "image/bmp":
+        return ".bmp"
+    return None
+
+
+def _decode_image_base64(payload: str) -> tuple[bytes, str | None]:
+    if not payload:
+        raise HTTPException(status_code=400, detail="Empty base64 payload.")
+
+    mime = None
+    data = payload.strip()
+    if data.startswith("data:"):
+        header, _, rest = data.partition(",")
+        if not rest:
+            raise HTTPException(status_code=400, detail="Invalid data URL payload.")
+        data = rest
+        mime = header[5:].split(";")[0] if ";" in header else header[5:]
+
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except Exception:
+        try:
+            decoded = base64.b64decode(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid base64 image data.") from e
+
+    if not decoded:
+        raise HTTPException(status_code=400, detail="Empty decoded image data.")
+    return decoded, mime
+
+
+def _cosine_distance(a: list[float], b: list[float]) -> float:
+    va = np.asarray(a, dtype=float)
+    vb = np.asarray(b, dtype=float)
+    denom = (np.linalg.norm(va) * np.linalg.norm(vb))
+    if denom == 0:
+        return 1.0
+    return float(1.0 - np.dot(va, vb) / denom)
+
+
+def _iter_images(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )
+
+
+def _pick_face_representation(reps: Any) -> dict:
+    if isinstance(reps, list):
+        if not reps:
+            raise ValueError("DeepFace.represent() returned an empty list.")
+        if len(reps) == 1:
+            return reps[0]
+
+        def area(rep: dict) -> float:
+            fa = rep.get("facial_area") or {}
+            w = fa.get("w") or fa.get("width") or 0
+            h = fa.get("h") or fa.get("height") or 0
+            return float(w) * float(h)
+
+        return max(reps, key=area)
+
+    if isinstance(reps, dict):
+        return reps
+
+    raise TypeError(f"Unexpected represent() return type: {type(reps).__name__}")
+
+
+def _poi_threshold() -> float:
+    try:
+        from deepface.commons import distance as dist
+
+        if hasattr(dist, "find_threshold"):
+            return float(dist.find_threshold(POI_MODEL_NAME, POI_DISTANCE_METRIC))
+        if hasattr(dist, "findThreshold"):
+            return float(dist.findThreshold(POI_MODEL_NAME, POI_DISTANCE_METRIC))
+    except Exception:
+        pass
+    return POI_DEFAULT_THRESHOLD
+
+
+def _load_or_build_poi_db(enforce_detection: bool = False) -> dict[str, Any]:
+    if POI_DB_PATH.exists():
+        try:
+            return json.loads(POI_DB_PATH.read_text())
+        except Exception:
+            pass
+
+    try:
+        from deepface import DeepFace
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"DeepFace unavailable: {e}")
+
+    images = _iter_images(POI_DIR)
+    if not images:
+        raise HTTPException(status_code=400, detail=f"No POI images found under: {POI_DIR}")
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    entries: list[dict[str, Any]] = []
+    skipped = 0
+
+    for img_path in images:
+        try:
+            reps = DeepFace.represent(
+                img_path=str(img_path),
+                model_name=POI_MODEL_NAME,
+                detector_backend=POI_DETECTOR_BACKEND,
+                enforce_detection=enforce_detection,
+            )
+            rep = _pick_face_representation(reps)
+            embedding = rep.get("embedding")
+            if embedding is None:
+                raise KeyError("Missing 'embedding' in DeepFace representation.")
+
+            rel = img_path.relative_to(REPO_ROOT).as_posix()
+            entries.append(
+                {
+                    "name": img_path.stem,
+                    "image_path": rel,
+                    "embedding": embedding,
+                }
+            )
+        except Exception:
+            skipped += 1
+
+    payload = {
+        "schema_version": 1,
+        "model_name": POI_MODEL_NAME,
+        "detector_backend": POI_DETECTOR_BACKEND,
+        "created_at_utc": created_at,
+        "count": len(entries),
+        "skipped": skipped,
+        "entries": entries,
+    }
+    POI_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    POI_DB_PATH.write_text(json.dumps(payload, indent=2))
+    return payload
+
+
+def _run_poi_match_bytes(data: bytes, suffix: str) -> dict[str, Any]:
+    try:
+        from deepface import DeepFace
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"DeepFace unavailable: {e}")
+
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+        tmp_path.write_bytes(data)
+
+        db = _load_or_build_poi_db(enforce_detection=False)
+        entries = db.get("entries") or []
+        if not entries:
+            raise HTTPException(status_code=400, detail="POI database is empty.")
+
+        reps = DeepFace.represent(
+            img_path=str(tmp_path),
+            model_name=POI_MODEL_NAME,
+            detector_backend=POI_DETECTOR_BACKEND,
+            enforce_detection=False,
+        )
+        rep = _pick_face_representation(reps)
+        suspect_emb = rep.get("embedding")
+        if suspect_emb is None:
+            raise HTTPException(status_code=400, detail="No face embedding could be computed for this image.")
+
+        best = None
+        for entry in entries:
+            emb = entry.get("embedding")
+            if not emb:
+                continue
+            dist = _cosine_distance(suspect_emb, emb)
+            if best is None or dist < best["distance"]:
+                best = {
+                    "name": entry.get("name"),
+                    "image_path": entry.get("image_path"),
+                    "distance": dist,
+                }
+
+        if best is None:
+            raise HTTPException(status_code=400, detail="No valid embeddings in POI database.")
+
+        threshold = _poi_threshold()
+        match = float(best["distance"]) <= float(threshold)
+
+        return {
+            "match": bool(match),
+            "distance": float(best["distance"]),
+            "threshold": float(threshold),
+            "model_name": POI_MODEL_NAME,
+            "detector_backend": POI_DETECTOR_BACKEND,
+            "distance_metric": POI_DISTANCE_METRIC,
+            "poi_name": best.get("name"),
+            "poi_image_path": best.get("image_path"),
+        }
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
 @app.get("/api/health")
@@ -192,3 +432,18 @@ async def detect_person(file: UploadFile = File(...), conf_threshold: float = DE
                 os.unlink(tmp_path)
             except Exception:
                 pass
+
+
+@app.post("/api/poi/match")
+async def poi_match(file: UploadFile = File(...)) -> dict[str, Any]:
+    suffix = Path(file.filename or "suspect.jpg").suffix or ".jpg"
+    data = await file.read()
+    return _run_poi_match_bytes(data, suffix)
+
+
+@app.post("/api/poi/match-base64")
+async def poi_match_base64(req: POIMatchBase64Request) -> dict[str, Any]:
+    data, mime = _decode_image_base64(req.image_base64)
+    filename = req.filename or "capture"
+    suffix = Path(filename).suffix or _image_suffix_from_mime(mime) or ".jpg"
+    return _run_poi_match_bytes(data, suffix)
