@@ -195,7 +195,7 @@ def open_spi(dev: str, mode: int, hz: int, bits: int = 8, no_cs: bool = False) -
     sp.max_speed_hz = hz
     sp.bits_per_word = bits
     if hasattr(sp, "no_cs"):
-        sp.no_cs = 1 if no_cs else 0
+        sp.no_cs = bool(no_cs)
     return sp
 
 def read_packet(spi: spidev.SpiDev, packet_len: int) -> bytes:
