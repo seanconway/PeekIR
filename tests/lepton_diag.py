@@ -5,16 +5,15 @@ Deterministic Lepton bring-up + VoSPI sanity for Raspberry Pi 5 (Debian Trixie).
 - Drives PW_DWN_L (GPIO20) HIGH continuously
 - Pulses RESET_L (GPIO21) LOW then HIGH
 - Waits for boot, then reads Lepton STATUS using proper 16-bit register addressing
-- Optionally samples VoSPI packets and reports discard/valid stats
-- Best-effort PNG reconstruction for a sanity check (not a guaranteed perfect decode)
+- Samples VoSPI packets and reports discard/valid stats
+- Optional best-effort PNG reconstruction for a sanity check (not a guaranteed perfect decode)
 
-Run with sudo (needed for GPIO + /dev/spidev).
+Run with sudo (needed for GPIO + /dev/spidev + /dev/i2c-*).
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from dataclasses import dataclass
 
@@ -29,8 +28,8 @@ except Exception:
     cv2 = None
 
 
-LEPTON_STATUS_REG = 0x0002  # per Lepton Software IDD command interface start-up text
-LEPTON_I2C_7BIT_DEFAULT = 0x2A  # IDD Table 1
+LEPTON_STATUS_REG = 0x0002  # Lepton STATUS register address (16-bit)
+LEPTON_I2C_7BIT_DEFAULT = 0x2A  # Lepton 7-bit I2C address :contentReference[oaicite:0]{index=0}
 
 
 @dataclass
@@ -50,10 +49,17 @@ class StatusBits:
         )
 
 
+def fmt_status(s: StatusBits) -> str:
+    return (
+        f"STATUS=0x{s.raw:04x} "
+        f"(boot_status={s.boot_status} boot_mode={s.boot_mode} busy={s.busy})"
+    )
+
+
 def read_reg16(bus: SMBus, addr7: int, reg16: int) -> int:
     """
-    Lepton CCI/TWI uses 16-bit register addresses and 16-bit data words (MSB then LSB).
-    Sequence: write reg_hi, reg_lo then read 2 bytes.
+    Lepton CCI/TWI uses 16-bit register addresses and 16-bit data words.
+    Sequence: write [reg_hi, reg_lo] then read 2 bytes (MSB then LSB). :contentReference[oaicite:1]{index=1}
     """
     reg_hi = (reg16 >> 8) & 0xFF
     reg_lo = reg16 & 0xFF
@@ -64,114 +70,102 @@ def read_reg16(bus: SMBus, addr7: int, reg16: int) -> int:
     return (data[0] << 8) | data[1]
 
 
-def fmt_status(s: StatusBits) -> str:
-    return (
-        f"STATUS=0x{s.raw:04x} "
-        f"(boot_status={s.boot_status} boot_mode={s.boot_mode} busy={s.busy})"
-    )
-
-
-def gpio_setup(pwdn_gpio: int, reset_gpio: int) -> tuple[gpiod.LineRequest, gpiod.LineRequest]:
+def gpio_request_lines(pwdn_gpio: int, reset_gpio: int):
     """
-    libgpiod v2 style requests. Uses gpiochip0 on Pi.
+    Request GPIO lines using libgpiod Python bindings on Debian.
+    Uses /dev/gpiochip0 explicitly (your gpiod.Chip signature requires a path).
     """
-    chip = gpiod.Chip("gpiochip0")
+    chip = gpiod.Chip("/dev/gpiochip0")
 
-    # PW_DWN_L: output HIGH (active-low power down line, must be held HIGH)
     pwdn_line = chip.get_line(pwdn_gpio)
-    pwdn_req = gpiod.LineRequest()
-    pwdn_req.consumer = "lepton_diag"
-    pwdn_req.request_type = gpiod.LINE_REQ_DIR_OUT
-    pwdn_line.request(pwdn_req, default_vals=[1])
-
-    # RESET_L: output, we will pulse low then high
     reset_line = chip.get_line(reset_gpio)
-    reset_req = gpiod.LineRequest()
-    reset_req.consumer = "lepton_diag"
-    reset_req.request_type = gpiod.LINE_REQ_DIR_OUT
-    reset_line.request(reset_req, default_vals=[1])
 
-    # Return the line objects via their requests so we can set values
-    # (Keep chip alive by keeping line objects referenced)
-    return (pwdn_line, reset_line)
+    # Prefer LineRequest API if available; fallback to old line.request signature.
+    if hasattr(gpiod, "LineRequest"):
+        # Newer python-gpiod style
+        req_out = gpiod.LineRequest()
+        req_out.consumer = "lepton_diag"
+        req_out.request_type = gpiod.LINE_REQ_DIR_OUT
+
+        pwdn_line.request(req_out, default_vals=[1])
+        reset_line.request(req_out, default_vals=[1])
+    else:
+        # Older libgpiod v1 python bindings style
+        pwdn_line.request(consumer="lepton_diag", type=gpiod.LINE_REQ_DIR_OUT, default_vals=[1])
+        reset_line.request(consumer="lepton_diag", type=gpiod.LINE_REQ_DIR_OUT, default_vals=[1])
+
+    return chip, pwdn_line, reset_line
 
 
-def pulse_reset(reset_line: gpiod.Line, low_ms: int = 200) -> None:
+def pulse_reset(reset_line, low_ms: int = 200) -> None:
     reset_line.set_value(0)
     time.sleep(low_ms / 1000.0)
     reset_line.set_value(1)
 
 
 def wait_for_boot(bus: SMBus, addr7: int, timeout_s: float = 10.0, poll_s: float = 0.2) -> StatusBits:
+    """
+    Poll STATUS until boot_status=1 and busy=0.
+    IDD says wait >=950ms after releasing RESET_L before I2C access. :contentReference[oaicite:2]{index=2}
+    """
     t0 = time.time()
-    last = None
+    last: StatusBits | None = None
     while (time.time() - t0) < timeout_s:
-        try:
-            v = read_reg16(bus, addr7, LEPTON_STATUS_REG)
-            st = StatusBits.from_u16(v)
-            last = st
-            if st.boot_status == 1 and st.busy == 0:
-                return st
-        except Exception as e:
-            print(f"[I2C] read error: {e}")
+        v = read_reg16(bus, addr7, LEPTON_STATUS_REG)
+        st = StatusBits.from_u16(v)
+        last = st
+        if st.boot_status == 1 and st.busy == 0:
+            return st
         time.sleep(poll_s)
     if last is None:
-        raise RuntimeError("No readable STATUS at all on I2C within timeout.")
+        raise RuntimeError("No readable STATUS on I2C within timeout.")
     return last
 
 
 def open_spi(bus: int, dev: int, hz: int) -> spidev.SpiDev:
     spi = spidev.SpiDev()
     spi.open(bus, dev)
-    spi.mode = 0b11  # SPI mode 3 required by Lepton VoSPI
+    spi.mode = 0b11  # Lepton VoSPI requires SPI Mode 3
     spi.bits_per_word = 8
     spi.max_speed_hz = hz
-    # Some kernels benefit from explicit cs-high disabled; spidev uses active-low CS by default.
     return spi
 
 
-def parse_packet_header(pkt: bytes) -> tuple[bool, int, int]:
+def parse_packet_header(pkt: bytes) -> tuple[bool, int]:
     """
-    Best-effort Lepton3/UWFOV style:
-    - Discard packets often have upper nibble 0xF (0xFx ..)
-    - Packet number is commonly in low 12 bits of first 2 bytes
-    - Segment often encoded in bits [6:4] of byte0 for segmented sensors
-    This function is intentionally conservative and used for stats/sync, not authoritative decoding.
+    Conservative packet classification:
+    - Discard packets often have upper nibble 0xF in byte0.
+    - Packet number is low 12 bits formed from byte0 low nibble + byte1.
     """
     b0 = pkt[0]
     b1 = pkt[1]
     discard = (b0 & 0xF0) == 0xF0
     pkt_num = ((b0 & 0x0F) << 8) | b1
-    segment = (b0 >> 4) & 0x07
-    return discard, pkt_num, segment
+    return discard, pkt_num
 
 
 def vospi_sample(spi: spidev.SpiDev, seconds: float, packet_len: int = 164) -> dict:
     """
-    Read packets continuously for `seconds`. Returns stats and first few headers.
-    packet_len=164 is typical for many Lepton modes (4 header + 160 payload).
+    Read packets continuously for `seconds`.
     """
     t0 = time.time()
     total = 0
     discards = 0
     valids = 0
     headers = []
-
-    # Also store a chunk of payloads for an optional best-effort image attempt.
     payloads = []
 
     while (time.time() - t0) < seconds:
         pkt = bytes(spi.readbytes(packet_len))
         total += 1
-        discard, pkt_num, seg = parse_packet_header(pkt)
+        discard, pkt_num = parse_packet_header(pkt)
         if discard:
             discards += 1
         else:
             valids += 1
-            # store first N headers for debugging
             if len(headers) < 40:
-                headers.append((pkt[0], pkt[1], pkt[2], pkt[3], pkt_num, seg))
-            payloads.append(pkt[4:])  # raw payload
+                headers.append((pkt[0], pkt[1], pkt[2], pkt[3], pkt_num))
+            payloads.append(pkt[4:])  # payload sans 4-byte header
 
     return {
         "total": total,
@@ -185,37 +179,33 @@ def vospi_sample(spi: spidev.SpiDev, seconds: float, packet_len: int = 164) -> d
 
 def best_effort_png(payloads: list[bytes], out_path: str) -> None:
     """
-    Best-effort reconstruction:
-    Treat each payload as 80 pixels of 16-bit big-endian (160 bytes => 80 u16).
-    Stack into [N][80]. If N>=240, take first 240 "lines" and pair them into 120 rows of 160 pixels.
-    Then normalize to 8-bit and save.
+    Best-effort reconstruction to give *some* visual feedback:
+    - Treat each payload as 80x uint16 (160 bytes => 80 pixels)
+    - Combine pairs of lines to get 160-wide rows: (120,160)
     """
     if cv2 is None:
-        raise RuntimeError("opencv-python not installed; cannot write PNG. Install or omit --save-png.")
+        raise RuntimeError("opencv-python not installed; install or omit --save-png.")
 
     if len(payloads) < 240:
-        raise RuntimeError(f"Not enough valid payloads for best-effort image (need >=240, have {len(payloads)}).")
+        raise RuntimeError(f"Need >=240 valid payloads for best-effort image; have {len(payloads)}")
 
-    # Take first 240 payloads
     lines80 = []
     for p in payloads[:240]:
         if len(p) < 160:
             continue
-        arr = np.frombuffer(p[:160], dtype=">u2")  # 80 uint16 big-endian
+        arr = np.frombuffer(p[:160], dtype=">u2")  # big-endian u16
         lines80.append(arr)
 
     if len(lines80) < 240:
-        raise RuntimeError(f"After parsing, only {len(lines80)} usable lines; expected 240.")
+        raise RuntimeError(f"Only {len(lines80)} usable lines after parsing; expected 240")
 
     lines80 = np.stack(lines80, axis=0)  # (240, 80)
+    rows160 = np.concatenate([lines80[0::2, :], lines80[1::2, :]], axis=1)  # (120, 160)
 
-    # Pair consecutive lines into 160-wide rows (120, 160)
-    rows160 = np.concatenate([lines80[0::2, :], lines80[1::2, :]], axis=1)
-
-    # Normalize to 8-bit for viewing
     lo = np.percentile(rows160, 1)
     hi = np.percentile(rows160, 99)
-    img = np.clip((rows160 - lo) * 255.0 / max(1.0, (hi - lo)), 0, 255).astype(np.uint8)
+    scale = max(1.0, (hi - lo))
+    img = np.clip((rows160 - lo) * 255.0 / scale, 0, 255).astype(np.uint8)
 
     ok = cv2.imwrite(out_path, img)
     if not ok:
@@ -238,22 +228,28 @@ def main() -> int:
 
     print("[GPIO] Requesting PW_DWN_L=HIGH and RESET_L control via libgpiod...")
     try:
-        pwdn_line, reset_line = gpio_setup(args.pwdn_gpio, args.reset_gpio)
+        chip, pwdn_line, reset_line = gpio_request_lines(args.pwdn_gpio, args.reset_gpio)
     except Exception as e:
         print(f"[FAIL] GPIO request failed: {e}")
         return 2
 
+    # Readback what we think we're driving
+    try:
+        print(f"[GPIO] PW_DWN_L (GPIO{args.pwdn_gpio}) set to: {pwdn_line.get_value()}")
+        print(f"[GPIO] RESET_L  (GPIO{args.reset_gpio}) set to: {reset_line.get_value()}")
+    except Exception:
+        pass
+
     print("[GPIO] Pulsing RESET_L low then high...")
     pulse_reset(reset_line, low_ms=200)
 
-    # Give it longer than the minimum 950ms after releasing RESET_L (IDD requirement)
+    # Wait longer than minimum (IDD says >=950ms after releasing RESET_L) :contentReference[oaicite:3]{index=3}
     print("[BOOT] Waiting 2.0s after RESET release before I2C access...")
     time.sleep(2.0)
 
     print(f"[I2C] Opening /dev/i2c-{args.i2c_bus}, addr=0x{args.i2c_addr:02x}")
     try:
         with SMBus(args.i2c_bus) as bus:
-            # Read status a few times for stability
             for i in range(5):
                 try:
                     v = read_reg16(bus, args.i2c_addr, LEPTON_STATUS_REG)
@@ -271,8 +267,11 @@ def main() -> int:
                 print(
                     "\n[FAIL] boot_status never became 1.\n"
                     "This is NOT a VoSPI problem yet.\n"
-                    "Most likely PW_DWN_L is not actually HIGH, RESET_L not reaching HIGH,\n"
-                    "or the 1.2V core rail/clock is wrong.\n"
+                    "Likely causes:\n"
+                    "  - PW_DWN_L not actually HIGH at the module\n"
+                    "  - RESET_L not reaching a valid HIGH\n"
+                    "  - core rail wrong (your VCC12 reading 1.3V is suspicious)\n"
+                    "  - MASTER_CLK amplitude/edge quality wrong\n"
                 )
                 return 3
 
@@ -307,8 +306,8 @@ def main() -> int:
     print(f"  valid packets:   {val} ({val_pct:.1f}%)")
 
     print("\n[VoSPI] First valid packet headers (up to 40):")
-    for (b0, b1, b2, b3, pkt_num, seg) in stats["headers"]:
-        print(f"  hdr: {b0:02x} {b1:02x} {b2:02x} {b3:02x}  pkt_num={pkt_num:4d} seg={seg}")
+    for (b0, b1, b2, b3, pkt_num) in stats["headers"]:
+        print(f"  hdr: {b0:02x} {b1:02x} {b2:02x} {b3:02x}  pkt_num={pkt_num:4d}")
 
     if args.save_png:
         try:
@@ -317,15 +316,14 @@ def main() -> int:
         except Exception as e:
             print(f"\n[PNG] Could not write PNG: {e}")
 
-    # Deterministic decision hints
     if val == 0:
         print(
             "\n[FAIL] 0 valid packets observed.\n"
             "This usually means one of:\n"
-            "  - SPI mode is wrong (must be mode 3)\n"
+            "  - SPI mode wrong (must be mode 3)\n"
             "  - CS/CLK/MISO wiring issue\n"
             "  - camera not actually running (PW_DWN_L/RESET_L)\n"
-            "  - SPI clock too fast *for your wiring* (try --spi-hz 8000000)\n"
+            "  - SPI clock too fast for wiring (try --spi-hz 8000000)\n"
         )
         return 6
 
@@ -333,10 +331,9 @@ def main() -> int:
         print(
             "\n[WARN] Very high discard rate.\n"
             "Common causes:\n"
-            "  - not clocking fast enough to drain full frames\n"
+            "  - not draining frames fast enough\n"
             "  - long gaps between reads\n"
-            "  - marginal signal integrity on SCLK/MISO/CS\n"
-            "Next: we will scope CS, SCLK, and MISO during capture.\n"
+            "  - marginal SCLK/MISO/CS signal integrity\n"
         )
         return 0
 
