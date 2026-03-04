@@ -2,12 +2,12 @@
 """
 Deterministic Lepton bring-up + VoSPI sanity for Raspberry Pi 5 (Debian Trixie).
 
-GPIO control via libgpiod v2:
+GPIO via libgpiod (v2 variants supported):
   GPIO20 -> PW_DWN_L (hold HIGH)
   GPIO21 -> RESET_L  (pulse LOW then HIGH)
 
 I2C via smbus2:
-  Proper 16-bit register addressing + 16-bit data words.
+  Proper 16-bit register address + 16-bit word reads.
 
 SPI via spidev:
   Mode 3, configurable clock.
@@ -32,8 +32,99 @@ except Exception:
     cv2 = None
 
 LEPTON_I2C_7BIT_DEFAULT = 0x2A
-LEPTON_STATUS_REG = 0x0002  # STATUS register address (16-bit)
+LEPTON_STATUS_REG = 0x0002  # 16-bit register address
 
+
+# ---------------------------
+# gpiod compatibility layer
+# ---------------------------
+
+def _get_gpiod_line_types():
+    """
+    Returns (LineSettings, DirectionEnum, ValueEnum, request_lines_fn)
+    supporting multiple python-gpiod / libgpiod layouts.
+
+    Known layouts:
+      A) from gpiod.line import Direction, Value, LineSettings   (common v2)
+         gpiod.request_lines(...) exists
+      B) gpiod.LineSettings / gpiod.Direction / gpiod.Value     (some builds)
+    """
+    # request_lines
+    req_fn = getattr(gpiod, "request_lines", None)
+    if req_fn is None:
+        raise RuntimeError("This gpiod module does not provide request_lines(); unsupported binding.")
+
+    # Try gpiod.line namespace first
+    try:
+        from gpiod.line import Direction, Value, LineSettings  # type: ignore
+        return LineSettings, Direction, Value, req_fn
+    except Exception:
+        pass
+
+    # Try top-level fallbacks
+    LineSettings = getattr(gpiod, "LineSettings", None)
+    Direction = getattr(gpiod, "Direction", None)
+    Value = getattr(gpiod, "Value", None)
+    if LineSettings and Direction and Value:
+        return LineSettings, Direction, Value, req_fn
+
+    # If neither works, print a helpful error
+    raise RuntimeError(
+        "Could not locate gpiod enums/classes (LineSettings/Direction/Value). "
+        "Your python-gpiod binding is different than expected."
+    )
+
+
+def gpio_open_outputs(chip_path: str, pwdn_gpio: int, reset_gpio: int):
+    """
+    Request two output lines via libgpiod v2 request_lines().
+    PW_DWN_L and RESET_L are active-low signals, but we drive them HIGH for 'deasserted'.
+    """
+    LineSettings, Direction, Value, request_lines = _get_gpiod_line_types()
+
+    # Determine enum members robustly
+    # OUTPUT:
+    dir_out = getattr(Direction, "OUTPUT", None) or getattr(Direction, "DIRECTION_OUTPUT", None)
+    if dir_out is None:
+        # Some builds might use integer enums; last resort
+        dir_out = Direction.OUTPUT  # type: ignore
+
+    # Values:
+    val_active = getattr(Value, "ACTIVE", None)
+    val_inactive = getattr(Value, "INACTIVE", None)
+    if val_active is None or val_inactive is None:
+        # Some builds may use 1/0 or HIGH/LOW
+        val_active = getattr(Value, "HIGH", 1)
+        val_inactive = getattr(Value, "LOW", 0)
+
+    cfg = {
+        pwdn_gpio: LineSettings(direction=dir_out, output_value=val_active),
+        reset_gpio: LineSettings(direction=dir_out, output_value=val_active),
+    }
+
+    req = request_lines(
+        chip_path,
+        consumer="lepton_diag",
+        config=cfg,
+    )
+
+    return req, val_active, val_inactive
+
+
+def gpio_set(req, offset: int, value_enum):
+    req.set_value(offset, value_enum)
+
+
+def pulse_reset(req, reset_gpio: int, val_active, val_inactive, low_ms: int = 200):
+    # Active-low RESET_L: LOW asserted => drive INACTIVE (low), then ACTIVE (high)
+    gpio_set(req, reset_gpio, val_inactive)
+    time.sleep(low_ms / 1000.0)
+    gpio_set(req, reset_gpio, val_active)
+
+
+# ---------------------------
+# Lepton helpers
+# ---------------------------
 
 @dataclass
 class StatusBits:
@@ -58,8 +149,8 @@ def fmt_status(s: StatusBits) -> str:
 
 def read_reg16(bus: SMBus, addr7: int, reg16: int) -> int:
     """
-    Lepton uses 16-bit register addresses and 16-bit reads. :contentReference[oaicite:2]{index=2}
-    Write reg_hi, reg_lo; then read 2 bytes MSB..LSB.
+    Lepton CCI/TWI uses 16-bit register addresses and 16-bit reads. :contentReference[oaicite:2]{index=2}
+    Write [reg_hi, reg_lo], then read 2 bytes MSB..LSB.
     """
     reg_hi = (reg16 >> 8) & 0xFF
     reg_lo = reg16 & 0xFF
@@ -85,32 +176,9 @@ def wait_for_boot(bus: SMBus, addr7: int, timeout_s: float = 10.0, poll_s: float
     return last
 
 
-def gpio_open_outputs(chip_path: str, pwdn_gpio: int, reset_gpio: int):
-    """
-    libgpiod v2: request multiple lines at once.
-    Returns a LineRequest object.
-    """
-    settings = {
-        pwdn_gpio: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT, output_value=gpiod.LineValue.ACTIVE),
-        reset_gpio: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT, output_value=gpiod.LineValue.ACTIVE),
-    }
-    req = gpiod.request_lines(
-        chip_path,
-        consumer="lepton_diag",
-        config=settings,
-    )
-    return req
-
-
-def gpio_set(req, offset: int, value_high: bool):
-    req.set_value(offset, gpiod.LineValue.ACTIVE if value_high else gpiod.LineValue.INACTIVE)
-
-
-def pulse_reset(req, reset_gpio: int, low_ms: int = 200):
-    gpio_set(req, reset_gpio, False)
-    time.sleep(low_ms / 1000.0)
-    gpio_set(req, reset_gpio, True)
-
+# ---------------------------
+# VoSPI helpers
+# ---------------------------
 
 def open_spi(bus: int, dev: int, hz: int) -> spidev.SpiDev:
     spi = spidev.SpiDev()
@@ -170,8 +238,8 @@ def best_effort_png(payloads: list[bytes], out_path: str):
     if len(lines80) < 240:
         raise RuntimeError(f"Only {len(lines80)} usable lines after parsing")
 
-    lines80 = np.stack(lines80, axis=0)            # (240, 80)
-    rows160 = np.concatenate([lines80[0::2], lines80[1::2]], axis=1)  # (120, 160)
+    lines80 = np.stack(lines80, axis=0)                         # (240, 80)
+    rows160 = np.concatenate([lines80[0::2], lines80[1::2]], 1)  # (120, 160)
 
     lo = np.percentile(rows160, 1)
     hi = np.percentile(rows160, 99)
@@ -181,6 +249,10 @@ def best_effort_png(payloads: list[bytes], out_path: str):
     if not cv2.imwrite(out_path, img):
         raise RuntimeError("cv2.imwrite failed")
 
+
+# ---------------------------
+# Main
+# ---------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -197,22 +269,23 @@ def main() -> int:
     ap.add_argument("--save-png", default="")
     args = ap.parse_args()
 
-    print("[GPIO] Requesting output lines...")
+    print("[GPIO] Requesting output lines via libgpiod...")
     try:
-        req = gpio_open_outputs(args.chip, args.pwdn_gpio, args.reset_gpio)
+        req, val_active, val_inactive = gpio_open_outputs(args.chip, args.pwdn_gpio, args.reset_gpio)
     except Exception as e:
         print(f"[FAIL] GPIO request failed: {e}")
         return 2
 
-    # Force PW_DWN_L HIGH, RESET_L HIGH
-    gpio_set(req, args.pwdn_gpio, True)
-    gpio_set(req, args.reset_gpio, True)
+    # Force both HIGH (deasserted)
+    gpio_set(req, args.pwdn_gpio, val_active)
+    gpio_set(req, args.reset_gpio, val_active)
 
     print("[GPIO] PW_DWN_L forced HIGH; RESET_L forced HIGH.")
     print("[GPIO] Pulsing RESET_L LOW then HIGH...")
-    pulse_reset(req, args.reset_gpio, low_ms=200)
+    pulse_reset(req, args.reset_gpio, val_active, val_inactive, low_ms=200)
 
-    print("[BOOT] Waiting 2.0s after reset release before I2C access (>=950ms required). :contentReference[oaicite:3]{index=3}")
+    # Wait longer than minimum 950ms after releasing RESET_L :contentReference[oaicite:3]{index=3}
+    print("[BOOT] Waiting 2.0s after reset release before I2C access (>=950ms required)...")
     time.sleep(2.0)
 
     print(f"[I2C] Using /dev/i2c-{args.i2c_bus} addr=0x{args.i2c_addr:02x}")
@@ -231,10 +304,10 @@ def main() -> int:
             if st.boot_status != 1:
                 print(
                     "\n[FAIL] boot_status never became 1. This is NOT a VoSPI problem yet.\n"
-                    "Deterministic next steps:\n"
-                    "  - While this script is running, measure J2 pin 20 (PW_DWN_L) and J2 pin 17 (RESET_L).\n"
-                    "    Both must be near IO-high (~2.8–3.3V). If not, the GPIO line is being pulled down.\n"
-                    "  - Verify VCC12 rail; your earlier 1.3V reading is suspicious (should be ~1.2V).\n"
+                    "Deterministic next step:\n"
+                    "  While this script is running, measure:\n"
+                    "    - J2 pin 20 (PW_DWN_L) to GND  -> should be IO-high\n"
+                    "    - J2 pin 17 (RESET_L)  to GND  -> should be IO-high except during the pulse\n"
                 )
                 return 3
 
@@ -280,7 +353,7 @@ def main() -> int:
             "\n[FAIL] 0 valid packets observed.\n"
             "Deterministic next steps:\n"
             "  - Scope J2 pin 10 (SPI_CS), J2 pin 7 (SPI_CLK), J2 pin 12 (SPI_MISO)\n"
-            "  - Verify mode=3 and that CS pulses low during reads\n"
+            "  - Verify CS pulses low during reads and CLK is a clean square wave at your configured hz\n"
             "  - Try --spi-hz 8000000 if wiring is long/noisy\n"
         )
         return 6
