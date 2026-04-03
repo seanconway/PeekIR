@@ -51,24 +51,51 @@ DIR_PIN_Y = 16 # Direction pins y-axis
 
 # Parameters
 duty_cycle = 50  # 50% duty cycle for PWM (0-100)
-f_x = 23040 # PWM frequency for X-axis in Hz (approx 36mm/s)
-f_y = 23040 # PWM frequency for Y-axis in Hz (approx 36mm/s)
-#i changed from 1600 to 6400 after changing driver microstep settings
+DEFAULT_FREQ = 23040  # Default PWM frequency (approx 36mm/s)
 steps_per_rev = 6400  # Microsteps per revolution for the motor, dictated by driver settings
 length_per_rev = 10   # Length per revolution in mm
 total_distance = 636  # Total traveling distance in mm for both axes
-# total_pixels = 10000  # REMOVED - using mm directly
 AXIS_MAX_MM = 636
 MARGIN_MM = 0  # How far from the borders we want motions to stay (in mm)
 STEP_MM = 20  # Default 'small' step used for direction-only commands
 
-# X-axis speed calculations
-speedX_rev_per_s = f_x / steps_per_rev  # Speed in revolutions per second
-speedX_mm_per_s = (speedX_rev_per_s) * length_per_rev  # Speed in mm/s
+# Parse speed from CLI BEFORE hardware init so HardwarePWM is created at the
+# correct frequency.  change_frequency() on rpi_hardware_pwm / Pi 5 does not
+# reliably update the running period, causing a 2x distance error when the
+# speed variable and actual PWM frequency are out of sync.
+def _parse_speed_token(v):
+    s = str(v).lower()
+    if s.endswith('mms'):
+        try:
+            return float(s[:-3])
+        except Exception:
+            return None
+    return None
 
-# Y-axis speed calculations
-speedY_rev_per_s = f_y / steps_per_rev  # Speed in revolutions per second
-speedY_mm_per_s = (speedY_rev_per_s) * length_per_rev  # Speed in mm/s
+_cli_speed_mm_s = None
+for _arg in sys.argv[1:]:
+    if '=' in _arg:
+        _k, _v = _arg.split('=', 1)
+        if _k == 'speed':
+            _cli_speed_mm_s = _parse_speed_token(_v)
+    else:
+        _s = _parse_speed_token(_arg.lstrip('-'))
+        if _s is not None:
+            _cli_speed_mm_s = _s
+
+if _cli_speed_mm_s is not None:
+    f_x = int(_cli_speed_mm_s * (steps_per_rev / length_per_rev))
+    f_y = f_x
+else:
+    f_x = DEFAULT_FREQ
+    f_y = DEFAULT_FREQ
+
+# Speed calculations (now based on the possibly-overridden frequency)
+speedX_rev_per_s = f_x / steps_per_rev
+speedX_mm_per_s = speedX_rev_per_s * length_per_rev
+
+speedY_rev_per_s = f_y / steps_per_rev
+speedY_mm_per_s = speedY_rev_per_s * length_per_rev
 
 
 # Reed Switch Configuration
@@ -943,55 +970,10 @@ def main_logic():
     # Unlike the old `silent` which redirected stdout to devnull (breaking
     # MOTOR_STARTED detection), --quiet only suppresses debug prints via qprint().
 
-    # Check for speed override first (applies to all modes)
-    target_speed_mm_s = None
-    for arg in sys.argv[1:]:
-        # check for speed token (e.g. 40mms)
-        # We need to handle 'speed=40mms' or just '40mms'
-        if '=' in arg:
-            key, val = arg.split('=', 1)
-            if key == 'speed':
-                s_val = parse_speed(val)
-                if s_val is not None:
-                    target_speed_mm_s = s_val
-        else:
-            # standalone token
-            spd = parse_speed(arg.lstrip('-'))
-            if spd is not None:
-                target_speed_mm_s = spd
-
-    # Apply speed override if present
-    if target_speed_mm_s is not None:
-        global f_x, f_y, speedX_rev_per_s, speedX_mm_per_s, speedX_pixels_per_s
-        global speedY_rev_per_s, speedY_mm_per_s, speedY_pixels_per_s
-
-        # Calculate new frequency
-        # f = speed_mm_s * steps_per_mm
-        # steps_per_mm = steps_per_rev / length_per_rev
-        new_freq = int(target_speed_mm_s * (steps_per_rev / length_per_rev))
-        
-        qprint(f"DEBUG: Speed requested: {target_speed_mm_s} mm/s")
-        qprint(f"DEBUG: New Frequency: {new_freq} Hz")
-        
-        # Update hardware PWM
-        pulX.change_frequency(new_freq)
-        pulY.change_frequency(new_freq)
-        
-        # Update global speed variables for sleep calculations
-        f_x = new_freq
-        f_y = new_freq
-        
-        speedX_rev_per_s = f_x / steps_per_rev
-        speedX_mm_per_s = speedX_rev_per_s * length_per_rev
-        # speedX_pixels_per_s = (speedX_mm_per_s / total_distance) * total_pixels
-        
-        speedY_rev_per_s = f_y / steps_per_rev
-        speedY_mm_per_s = speedY_rev_per_s * length_per_rev
-        # speedY_pixels_per_s = (speedY_mm_per_s / total_distance) * total_pixels
-        
-        qprint(f"DEBUG: Calculated Speed: {speedX_mm_per_s:.2f} mm/s")
-    else:
-        qprint(f"DEBUG: Default Speed: {speedX_mm_per_s:.2f} mm/s")
+    # Speed was already parsed and applied at module level (before HardwarePWM
+    # init) so that the PWM objects are created at the correct frequency.
+    # The change_frequency() approach is unreliable on the Pi 5.
+    qprint(f"DEBUG: Speed: {speedX_mm_per_s:.2f} mm/s  (PWM freq: {f_x} Hz)")
 
     # Check for position request
     if "--position" in sys.argv:
