@@ -59,38 +59,9 @@ AXIS_MAX_MM = 636
 MARGIN_MM = 0  # How far from the borders we want motions to stay (in mm)
 STEP_MM = 20  # Default 'small' step used for direction-only commands
 
-# Parse speed from CLI BEFORE hardware init so HardwarePWM is created at the
-# correct frequency.  change_frequency() on rpi_hardware_pwm / Pi 5 does not
-# reliably update the running period, causing a 2x distance error when the
-# speed variable and actual PWM frequency are out of sync.
-def _parse_speed_token(v):
-    s = str(v).lower()
-    if s.endswith('mms'):
-        try:
-            return float(s[:-3])
-        except Exception:
-            return None
-    return None
+f_x = DEFAULT_FREQ
+f_y = DEFAULT_FREQ
 
-_cli_speed_mm_s = None
-for _arg in sys.argv[1:]:
-    if '=' in _arg:
-        _k, _v = _arg.split('=', 1)
-        if _k == 'speed':
-            _cli_speed_mm_s = _parse_speed_token(_v)
-    else:
-        _s = _parse_speed_token(_arg.lstrip('-'))
-        if _s is not None:
-            _cli_speed_mm_s = _s
-
-if _cli_speed_mm_s is not None:
-    f_x = int(_cli_speed_mm_s * (steps_per_rev / length_per_rev))
-    f_y = f_x
-else:
-    f_x = DEFAULT_FREQ
-    f_y = DEFAULT_FREQ
-
-# Speed calculations (now based on the possibly-overridden frequency)
 speedX_rev_per_s = f_x / steps_per_rev
 speedX_mm_per_s = speedX_rev_per_s * length_per_rev
 
@@ -179,10 +150,10 @@ if any(arg in ('-h', '--help', 'help') for arg in sys.argv[1:]):
 # GPIO 13 -> PWM0 (Channel 1)
 # GPIO 12 -> PWM0 (Channel 0)
 # Note: On this RPi 5, the RP1 PWM controller appears as pwmchip0.
-pulX = HardwarePWM(pwm_channel=1, hz=f_x, chip=0)
+pulX = HardwarePWM(pwm_channel=1, hz=DEFAULT_FREQ, chip=0)
 dirX = DigitalOutputDevice(DIR_PIN_X, 
                            active_high=True)  # Active high to rotate CW
-pulY = HardwarePWM(pwm_channel=0, hz=f_y, chip=0)
+pulY = HardwarePWM(pwm_channel=0, hz=DEFAULT_FREQ, chip=0)
 dirY = DigitalOutputDevice(DIR_PIN_Y, 
                            active_high=True)  # Active high to rotate CW
 
@@ -970,9 +941,41 @@ def main_logic():
     # Unlike the old `silent` which redirected stdout to devnull (breaking
     # MOTOR_STARTED detection), --quiet only suppresses debug prints via qprint().
 
-    # Speed was already parsed and applied at module level (before HardwarePWM
-    # init) so that the PWM objects are created at the correct frequency.
-    # The change_frequency() approach is unreliable on the Pi 5.
+    # Check for speed override (applies to all modes including scan)
+    target_speed_mm_s = None
+    for arg in sys.argv[1:]:
+        if '=' in arg:
+            key, val = arg.split('=', 1)
+            if key == 'speed':
+                s_val = parse_speed(val)
+                if s_val is not None:
+                    target_speed_mm_s = s_val
+        else:
+            spd = parse_speed(arg.lstrip('-'))
+            if spd is not None:
+                target_speed_mm_s = spd
+
+    if target_speed_mm_s is not None:
+        global f_x, f_y, speedX_rev_per_s, speedX_mm_per_s
+        global speedY_rev_per_s, speedY_mm_per_s
+
+        new_freq = int(target_speed_mm_s * (steps_per_rev / length_per_rev))
+
+        qprint(f"DEBUG: Speed requested: {target_speed_mm_s} mm/s")
+        qprint(f"DEBUG: New Frequency: {new_freq} Hz")
+
+        pulX.change_frequency(new_freq)
+        pulY.change_frequency(new_freq)
+
+        f_x = new_freq
+        f_y = new_freq
+
+        speedX_rev_per_s = f_x / steps_per_rev
+        speedX_mm_per_s = speedX_rev_per_s * length_per_rev
+
+        speedY_rev_per_s = f_y / steps_per_rev
+        speedY_mm_per_s = speedY_rev_per_s * length_per_rev
+
     qprint(f"DEBUG: Speed: {speedX_mm_per_s:.2f} mm/s  (PWM freq: {f_x} Hz)")
 
     # Check for position request
