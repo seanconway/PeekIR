@@ -9,7 +9,7 @@
 #   python3 motorTest_rev14.py origin --margin=200
 #   python3 motorTest_rev14.py up=50mm speed=18mms
 #   python3 motorTest_rev14.py right=280mm speed=18mms --quiet
-#   python3 motorTest_rev14.py scan --rows 40 --x-travel 680 --y-step 1 speed=18mms
+#   python3 motorTest_rev14.py scan --rows 41 --x-travel 400 --y-step 10 speed=18mms
 
 from gpiozero import DigitalOutputDevice, Button
 from rpi_hardware_pwm import HardwarePWM
@@ -51,11 +51,11 @@ DIR_PIN_Y = 16 # Direction pins y-axis
 
 # Parameters
 duty_cycle = 50  # 50% duty cycle for PWM (0-100)
-DEFAULT_FREQ = 23040  # Default PWM frequency (approx 36mm/s)
+DEFAULT_FREQ = 23040  # Default PWM frequency
 steps_per_rev = 6400  # Microsteps per revolution for the motor, dictated by driver settings
-length_per_rev = 10   # Length per revolution in mm
-total_distance = 636  # Total traveling distance in mm for both axes
-AXIS_MAX_MM = 636
+length_per_rev = 40   # Calibrated: 100mm cmd → 400mm actual ⇒ 4x correction
+total_distance = 680  # Measured physical travel distance in mm for both axes
+AXIS_MAX_MM = 680
 MARGIN_MM = 0  # How far from the borders we want motions to stay (in mm)
 STEP_MM = 20  # Default 'small' step used for direction-only commands
 
@@ -1075,9 +1075,9 @@ def main_logic():
 
     # ── scan command: autonomous snake-pattern SAR scan ──────────────
     if "scan" in sys.argv:
-        scan_rows = 40
-        scan_x_travel = 680
-        scan_y_step = 1
+        scan_rows = 41
+        scan_x_travel = 400
+        scan_y_step = 10
 
         args = sys.argv[1:]
         for idx, a in enumerate(args):
