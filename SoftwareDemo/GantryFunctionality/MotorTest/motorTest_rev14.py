@@ -9,7 +9,7 @@
 #   python3 motorTest_rev14.py origin --margin=200
 #   python3 motorTest_rev14.py up=50mm speed=18mms
 #   python3 motorTest_rev14.py right=280mm speed=18mms --quiet
-#   python3 motorTest_rev14.py scan --rows 40 --x-travel 420 --y-step 1 speed=18mms
+#   python3 motorTest_rev14.py scan --rows 40 --x-travel 280 --y-step 1 speed=18mms
 
 from gpiozero import DigitalOutputDevice, Button
 from rpi_hardware_pwm import HardwarePWM
@@ -1076,7 +1076,7 @@ def main_logic():
     # ── scan command: autonomous snake-pattern SAR scan ──────────────
     if "scan" in sys.argv:
         scan_rows = 40
-        scan_x_travel = 420
+        scan_x_travel = 280
         scan_y_step = 1
 
         args = sys.argv[1:]
