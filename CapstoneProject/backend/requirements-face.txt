@@ -1,0 +1,4 @@
+# Face recognition (DeepFace).
+# Note: DeepFace pulls in heavier ML dependencies (TensorFlow/Keras) and may be sensitive
+# to your Python version. If install fails, pin Python to a DeepFace-supported version.
+deepface

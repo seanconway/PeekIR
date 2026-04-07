@@ -1,0 +1,12 @@
+ultralytics==8.2.52
+# PyTorch 2.6+ tightened safe deserialization defaults; keep <2.6 for easiest installs.
+torch>=2.2,<2.6
+torchvision>=0.17,<0.21
+torchaudio>=2.2,<2.6
+opencv-python
+numpy
+pillow
+matplotlib
+tqdm
+psutil
+pyyaml

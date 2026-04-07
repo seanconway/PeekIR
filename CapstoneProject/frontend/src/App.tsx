@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { detectPath, detectUpload, listImages, poiMatchBase64, poiMatchUpload, type DetectResponse, type ImageListItem, type POIMatchResponse } from "./api";
+import { detectPath, detectUpload, fetchIrDetection, listImages, poiMatchBase64, poiMatchUpload, type DetectResponse, type ImageListItem, type POIMatchResponse } from "./api";
 
 function fmtPct(x: number) {
   if (!Number.isFinite(x)) return "–";
@@ -25,6 +25,8 @@ export default function App() {
   const [poiCaptureUrl, setPoiCaptureUrl] = useState<string | null>(null);
   const defaultCameraStreamUrl = import.meta.env.VITE_CAMERA_STREAM_URL ?? "/api/camera/stream";
   const defaultCameraFrameUrl = import.meta.env.VITE_CAMERA_FRAME_URL ?? "/api/camera/frame";
+  const defaultIrStreamUrl = import.meta.env.VITE_IR_CAMERA_STREAM_URL ?? "/api/ir/stream";
+  const defaultIrFrameUrl = import.meta.env.VITE_IR_CAMERA_FRAME_URL ?? "/api/ir/frame";
   const [cameraStreamUrl, setCameraStreamUrl] = useState<string>(() => {
     const saved = localStorage.getItem("cameraStreamUrl");
     return saved ?? defaultCameraStreamUrl;
@@ -33,12 +35,24 @@ export default function App() {
   const [usePolling, setUsePolling] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<"idle" | "loading" | "live" | "captured" | "error">("idle");
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [irStreamUrl, setIrStreamUrl] = useState<string>(() => {
+    const saved = localStorage.getItem("irStreamUrl");
+    return saved ?? defaultIrStreamUrl;
+  });
+  const [irFrameUrl, setIrFrameUrl] = useState<string>(() => `${defaultIrFrameUrl}?ts=${Date.now()}`);
+  const [useIrPolling, setUseIrPolling] = useState(false);
+  const [irStatus, setIrStatus] = useState<"idle" | "loading" | "live" | "error">("idle");
+  const [irError, setIrError] = useState<string | null>(null);
+  const [irResult, setIrResult] = useState<DetectResponse | null>(null);
   const [showPoiUpload, setShowPoiUpload] = useState(false);
 
   const cameraImgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const autoCaptureTimerRef = useRef<number | null>(null);
   const pollTimerRef = useRef<number | null>(null);
+  const irPollTimerRef = useRef<number | null>(null);
+  const irDetectTimerRef = useRef<number | null>(null);
+  const irDetectBusyRef = useRef(false);
   const showPoiUploadRef = useRef(showPoiUpload);
 
   function log(message: string) {
@@ -60,12 +74,18 @@ export default function App() {
     if (!result?.annotated_png_base64) return null;
     return `data:image/png;base64,${result.annotated_png_base64}`;
   }, [result]);
+  const irAnnotatedUrl = useMemo(() => {
+    if (!irResult?.annotated_png_base64) return null;
+    return `data:image/png;base64,${irResult.annotated_png_base64}`;
+  }, [irResult]);
 
   const poiPreviewUrl = useMemo(() => {
     if (poiCaptureUrl) return poiCaptureUrl;
     if (!poiFile) return null;
     return URL.createObjectURL(poiFile);
   }, [poiCaptureUrl, poiFile]);
+  const poiDetails = poiResult?.poi_details ?? null;
+  const poiWanted = poiResult?.match && poiDetails?.wanted === true;
 
   useEffect(() => {
     let cancelled = false;
@@ -91,6 +111,10 @@ export default function App() {
   }, [cameraStreamUrl]);
 
   useEffect(() => {
+    localStorage.setItem("irStreamUrl", irStreamUrl);
+  }, [irStreamUrl]);
+
+  useEffect(() => {
     if (pollTimerRef.current) {
       window.clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
@@ -110,6 +134,27 @@ export default function App() {
       }
     };
   }, [usePolling, defaultCameraFrameUrl]);
+
+  useEffect(() => {
+    if (irPollTimerRef.current) {
+      window.clearInterval(irPollTimerRef.current);
+      irPollTimerRef.current = null;
+    }
+    if (!useIrPolling) return;
+
+    const tick = () => {
+      setIrFrameUrl(`${defaultIrFrameUrl}?ts=${Date.now()}`);
+    };
+    tick();
+    irPollTimerRef.current = window.setInterval(tick, 250);
+
+    return () => {
+      if (irPollTimerRef.current) {
+        window.clearInterval(irPollTimerRef.current);
+        irPollTimerRef.current = null;
+      }
+    };
+  }, [useIrPolling, defaultIrFrameUrl]);
 
   const filteredGallery = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -184,6 +229,20 @@ export default function App() {
     await runPoiMatchUpload(poiFile);
   }
 
+  async function refreshIrDetection() {
+    if (irDetectBusyRef.current) return;
+    irDetectBusyRef.current = true;
+    try {
+      const res = await fetchIrDetection(conf);
+      setIrResult(res);
+      setIrError(null);
+    } catch (e) {
+      setIrError(e instanceof Error ? e.message : String(e));
+    } finally {
+      irDetectBusyRef.current = false;
+    }
+  }
+
   function scheduleAutoCapture(delayMs: number = 1500) {
     if (autoCaptureTimerRef.current) {
       window.clearTimeout(autoCaptureTimerRef.current);
@@ -246,6 +305,43 @@ export default function App() {
   }, [cameraStreamUrl]);
 
   useEffect(() => {
+    if (irPollTimerRef.current) {
+      window.clearInterval(irPollTimerRef.current);
+      irPollTimerRef.current = null;
+    }
+    if (irDetectTimerRef.current) {
+      window.clearInterval(irDetectTimerRef.current);
+      irDetectTimerRef.current = null;
+    }
+    setUseIrPolling(false);
+    if (!irStreamUrl.trim()) {
+      setIrStatus("error");
+      setIrError("IR camera stream URL is empty.");
+      return;
+    }
+    setIrStatus("loading");
+    setIrError(null);
+  }, [irStreamUrl]);
+
+  useEffect(() => {
+    if (irDetectTimerRef.current) {
+      window.clearInterval(irDetectTimerRef.current);
+      irDetectTimerRef.current = null;
+    }
+    if (irStatus !== "live") return;
+    void refreshIrDetection();
+    irDetectTimerRef.current = window.setInterval(() => {
+      void refreshIrDetection();
+    }, 2500);
+    return () => {
+      if (irDetectTimerRef.current) {
+        window.clearInterval(irDetectTimerRef.current);
+        irDetectTimerRef.current = null;
+      }
+    };
+  }, [irStatus, conf]);
+
+  useEffect(() => {
     if (cameraStatus === "error") {
       setShowPoiUpload(true);
     }
@@ -277,6 +373,14 @@ export default function App() {
 
   const status = result?.has_gun ? "Gun detected" : result ? "No gun detected" : "—";
   const statusTone = result?.has_gun ? "danger" : result ? "ok" : "neutral";
+  const irStatusLabel = irResult?.has_knife
+    ? "Knife detected in IR feed"
+    : irResult?.has_weapon
+      ? "Weapon detected in IR feed"
+      : irResult
+        ? "No weapon detected in IR feed"
+        : "IR monitoring idle";
+  const irStatusTone = irResult?.has_weapon ? "danger" : irResult ? "ok" : "neutral";
 
   return (
     <div className="page">
@@ -522,11 +626,11 @@ export default function App() {
         </section>
       </main>
 
-      <section className="card" style={{ marginTop: 14 }}>
+      <section className={`card ${poiWanted ? "wanted" : ""}`} style={{ marginTop: 14 }}>
         <div className="cardTitle">POI Match (Criminal Background Check)</div>
         <div className="row split">
           <div className="hint">
-            Camera status: <span className="mono">{cameraStatus}</span>.{" "}
+            RGB status: <span className="mono">{cameraStatus}</span>.{" "}
             {cameraStatus === "loading"
               ? "Connecting to camera stream…"
               : cameraStatus === "live"
@@ -536,6 +640,7 @@ export default function App() {
                   : cameraStatus === "error"
                     ? "Camera unavailable."
                     : "Camera idle."}
+            {" "}IR status: <span className="mono">{irStatus}</span>.
           </div>
           <div className="logActions" style={{ marginTop: 0 }}>
             <button
@@ -561,17 +666,30 @@ export default function App() {
 
         <div className="row">
           <label className="label">
-            Camera stream URL (Pi)
+            RGB camera stream URL (Pi)
             <input
               className="input"
-              placeholder="http://pi.local:8000/api/camera/stream"
+              placeholder="http://pi.local:9000/api/camera/stream"
               value={cameraStreamUrl}
               onChange={(e) => setCameraStreamUrl(e.target.value)}
             />
           </label>
         </div>
 
+        <div className="row">
+          <label className="label">
+            IR camera stream URL (Pi)
+            <input
+              className="input"
+              placeholder="http://pi.local:9000/api/ir/stream"
+              value={irStreamUrl}
+              onChange={(e) => setIrStreamUrl(e.target.value)}
+            />
+          </label>
+        </div>
+
         {cameraError ? <div className="error">{cameraError}</div> : null}
+        {irError ? <div className="error">{irError}</div> : null}
 
         {showPoiUpload ? (
           <div className="row split">
@@ -604,6 +722,11 @@ export default function App() {
         <div className="row">
           <div className="hint">
             Uses POI embeddings from <span className="mono">backend/data/poi_db/poi_embeddings.json</span>.
+          </div>
+        </div>
+        <div className="row">
+          <div className="hint">
+            IR alerting uses the current YOLO weapon weights. The existing model only guarantees the class it was trained on; knife-specific alerts require knife labels in the weights.
           </div>
         </div>
         {poiError ? <div className="error">{poiError}</div> : null}
@@ -652,13 +775,62 @@ export default function App() {
             <canvas ref={canvasRef} style={{ display: "none" }} />
           </div>
           <div className="imageFrame">
-            {poiResult?.poi_image_path ? (
-              <img className="image" src={`/api/image?path=${encodeURIComponent(poiResult.poi_image_path)}`} alt="Matched POI" />
-            ) : (
-              <div className="placeholder">Matched POI image will appear here</div>
-            )}
+            <img
+              key={useIrPolling ? irFrameUrl : irStreamUrl}
+              className="image"
+              src={useIrPolling ? irFrameUrl : irStreamUrl}
+              onLoad={() => {
+                if (irStatus !== "live") {
+                  setIrStatus("live");
+                  setIrError(null);
+                }
+              }}
+              onError={() => {
+                if (!useIrPolling) {
+                  setUseIrPolling(true);
+                  setIrStatus("loading");
+                  setIrError("IR stream failed; falling back to polling.");
+                  return;
+                }
+                setIrStatus("error");
+                setIrError("Unable to load IR frame.");
+              }}
+            />
+            {irStatus !== "live" ? (
+              <div className="placeholder">
+                {irStatus === "loading" ? "Connecting to IR camera…" : irStatus === "error" ? "IR camera unavailable" : "IR camera idle"}
+              </div>
+            ) : null}
           </div>
         </div>
+        <div className={`status ${irStatusTone}`} style={{ marginTop: 10 }}>
+          <div className="statusLabel">{irStatusLabel}</div>
+          <div className="statusMeta">
+            {irResult
+              ? `Labels: ${irResult.detections.length ? irResult.detections.map((d) => d.label).join(", ") : "none"}`
+              : irStatus === "live"
+                ? "IR feed live. Waiting for detection results."
+                : "IR feed not live yet."}
+          </div>
+        </div>
+        {(irAnnotatedUrl || poiResult?.poi_image_path) ? (
+          <div className="poiGrid" style={{ marginTop: 12 }}>
+            <div className="imageFrame">
+              {irAnnotatedUrl ? (
+                <img className="image" src={irAnnotatedUrl} alt="Annotated IR result" />
+              ) : (
+                <div className="placeholder">IR detection snapshot will appear here</div>
+              )}
+            </div>
+            <div className="imageFrame">
+              {poiResult?.poi_image_path ? (
+                <img className="image" src={`/api/image?path=${encodeURIComponent(poiResult.poi_image_path)}`} alt="Matched POI" />
+              ) : (
+                <div className="placeholder">Matched POI image will appear here</div>
+              )}
+            </div>
+          </div>
+        ) : null}
         {poiResult ? (
           <div className={`status ${poiResult.match ? "danger" : "ok"}`} style={{ marginTop: 10 }}>
             <div className="statusLabel">
@@ -667,6 +839,21 @@ export default function App() {
             <div className="statusMeta">
               Best match: {poiResult.poi_name ?? "—"} • Distance: {poiResult.distance.toFixed(4)} • Threshold: {poiResult.threshold.toFixed(4)}
             </div>
+          </div>
+        ) : null}
+        {poiResult && poiResult.match && poiDetails ? (
+          <div className={`poiDetails ${poiWanted ? "wanted" : ""}`}>
+            <div className="poiDetailsTitle">Matched Record</div>
+            <div className="poiDetailsRow">Name: {poiDetails.name ?? poiResult.poi_name ?? "—"}</div>
+            {poiDetails.age != null ? <div className="poiDetailsRow">Age: {poiDetails.age}</div> : null}
+            {poiDetails.dob ? <div className="poiDetailsRow">DOB: {poiDetails.dob}</div> : null}
+            {poiDetails.crime ? <div className="poiDetailsRow">Crime Committed: {poiDetails.crime}</div> : null}
+            {poiDetails.extra_info ? <div className="poiDetailsRow">Additional Info: {poiDetails.extra_info}</div> : null}
+            {poiDetails.wanted === true ? (
+              <div className="poiDetailsRow">Currently wanted</div>
+            ) : poiDetails.wanted === false ? (
+              <div className="poiDetailsRow">Not currently wanted</div>
+            ) : null}
           </div>
         ) : null}
       </section>
