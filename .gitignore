@@ -37,3 +37,12 @@ Safehaven-Lua/sar_interactive_slic*
 Safehaven-Lua/sar_3d_scatter*
 Safehaven-Classification/output_images/
 Safehaven-Classification/train/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+CapstoneProject/frontend/node_modules/
+CapstoneProject/frontend/dist/
+CapstoneProject/frontend/tsconfig.tsbuildinfo
+CapstoneProject/backend/logs/
+CapstoneProject/backend/runs/

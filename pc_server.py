@@ -11,6 +11,9 @@ Endpoints:
   GET /api/health
   GET /api/camera/frame
   GET /api/camera/stream
+  GET /api/ir/frame
+  GET /api/ir/stream
+  GET /api/ir/detect
   POST /api/detect-person  (multipart/form-data, field name: file)
   POST /api/poi/match       (multipart/form-data, field name: file)
   POST /api/poi/match-base64 (JSON payload)
@@ -20,9 +23,11 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -45,13 +50,18 @@ REPO_ROOT = Path(__file__).resolve().parent
 CAPSTONE_BACKEND = REPO_ROOT / "CapstoneProject" / "backend"
 
 POI_DB_PATH = CAPSTONE_BACKEND / "data" / "poi_db" / "poi_embeddings.json"
+POI_METADATA_PATH = CAPSTONE_BACKEND / "data" / "poi_db" / "poi_metadata.json"
 POI_DIR = CAPSTONE_BACKEND / "data" / "faces" / "poi"
 POI_MODEL_NAME = "ArcFace"
 POI_DETECTOR_BACKEND = "retinaface"
 POI_DISTANCE_METRIC = "cosine"
 POI_DEFAULT_THRESHOLD = 0.68
+KNIFE_WEIGHTS_PATH = CAPSTONE_BACKEND / "models" / "yolov8n.pt"
+KNIFE_LABELS = {"knife"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 CAPSTONE_ROOT = REPO_ROOT / "CapstoneProject"
+LOG_DIR = CAPSTONE_BACKEND / "logs"
+LOG_FILE = LOG_DIR / "backend.log"
 if CAPSTONE_ROOT.exists():
     sys.path.insert(0, str(CAPSTONE_ROOT))
 
@@ -60,11 +70,53 @@ from backend.scripts.personDetect import (  # type: ignore  # noqa: E402
     DEFAULT_PERSON_WEIGHTS_PATH,
     CONF_THRESHOLD as DEFAULT_PERSON_CONF,
 )
+from backend.scripts.gunDetect import (  # type: ignore  # noqa: E402
+    detect_weapons,
+    Detection as WeaponDetection,
+    DEFAULT_WEIGHTS_PATH,
+    CONF_THRESHOLD as DEFAULT_WEAPON_CONF,
+    load_model,
+)
 
 
 class POIMatchBase64Request(BaseModel):
     image_base64: str = Field(..., description="Base64 or data URL for the captured suspect image.")
     filename: str | None = Field(default=None, description="Optional filename hint for the uploaded image.")
+
+
+class DetectPathRequest(BaseModel):
+    path: str = Field(..., description="Image path on the machine running the backend server.")
+    conf_threshold: float = Field(default=DEFAULT_WEAPON_CONF, ge=0.0, le=1.0)
+    weights_path: str | None = Field(default=None, description="Optional weights path override.")
+
+
+def _configure_logging() -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("peekir.pc_backend")
+    logger.setLevel(logging.INFO)
+
+    if not any(
+        isinstance(h, logging.FileHandler) and Path(getattr(h, "baseFilename", "")).name == LOG_FILE.name
+        for h in logger.handlers
+    ):
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(fmt)
+        logger.addHandler(file_handler)
+
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(fmt)
+        logger.addHandler(stream_handler)
+
+    logger.propagate = False
+    return logger
+
+
+logger = _configure_logging()
 
 app = FastAPI(title="PC Backend Server", version="0.1.0")
 app.add_middleware(
@@ -74,6 +126,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.info("%s %s -> %s (%.1fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+        return response
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.exception("%s %s -> EXCEPTION (%.1fms): %s", request.method, request.url.path, elapsed_ms, e)
+        raise
 
 
 def _pi_base_url() -> str:
@@ -181,6 +247,20 @@ def _cosine_distance(a: list[float], b: list[float]) -> float:
     return float(1.0 - np.dot(va, vb) / denom)
 
 
+def _thumbnail_base64(path: Path, size: int = 96) -> str | None:
+    try:
+        from PIL import Image
+
+        img = Image.open(path)
+        img = img.convert("RGB")
+        img.thumbnail((size, size))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=75)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
 def _iter_images(root: Path) -> list[Path]:
     if not root.exists():
         return []
@@ -222,6 +302,114 @@ def _poi_threshold() -> float:
     except Exception:
         pass
     return POI_DEFAULT_THRESHOLD
+
+
+def _result_plot_png_base64(result: Any) -> str | None:
+    try:
+        annotated = result.plot()
+    except Exception:
+        return None
+
+    try:
+        rgb = annotated[..., ::-1]
+        ok, encoded = cv2.imencode(".png", rgb)
+        if not ok:
+            return None
+        return base64.b64encode(encoded.tobytes()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _safe_float(x: Any) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
+
+
+def _safe_int(x: Any) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return -1
+
+
+def _detect_knives(
+    image_path: str | Path,
+    *,
+    weights_path: str | Path = KNIFE_WEIGHTS_PATH,
+    conf_threshold: float = DEFAULT_WEAPON_CONF,
+) -> tuple[bool, list[WeaponDetection], Any]:
+    image_path = Path(image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+    if not Path(weights_path).exists():
+        return False, [], None
+
+    model = load_model(weights_path)
+    names = getattr(model, "names", {}) or {}
+    knife_class_ids = [
+        int(cls_id)
+        for cls_id, label in names.items()
+        if str(label).strip().lower() in KNIFE_LABELS
+    ]
+    if not knife_class_ids:
+        return False, [], None
+
+    def _run_predict(conf: float, imgsz: int):
+        results = model.predict(
+            source=str(image_path),
+            conf=conf,
+            imgsz=imgsz,
+            classes=knife_class_ids,
+            verbose=False,
+        )
+        return results[0], conf, imgsz
+
+    result, used_conf, used_imgsz = _run_predict(conf_threshold, 640)
+
+    def _extract_detections(res: Any) -> list[WeaponDetection]:
+        res_names = res.names
+        dets: list[WeaponDetection] = []
+        for box in res.boxes:
+            cls_id = _safe_int(box.cls[0])
+            label = str(res_names.get(cls_id, str(cls_id)))
+            conf = _safe_float(box.conf[0])
+            xyxy = None
+            try:
+                xyxy_raw = box.xyxy[0].tolist()
+                xyxy = [float(v) for v in xyxy_raw]
+            except Exception:
+                xyxy = None
+            dets.append(WeaponDetection(class_id=cls_id, label=label, confidence=conf, xyxy=xyxy))
+        return dets
+
+    detections = _extract_detections(result)
+    if not detections:
+        for conf_try, imgsz_try in [
+            (min(conf_threshold, 0.2), 960),
+            (0.1, 960),
+        ]:
+            try:
+                res_try, used_conf, used_imgsz = _run_predict(conf_try, imgsz_try)
+                dets_try = _extract_detections(res_try)
+                if dets_try:
+                    result = res_try
+                    detections = dets_try
+                    break
+            except Exception:
+                continue
+
+    has_knife = len(detections) > 0
+    try:
+        result._meta = {
+            "used_conf": used_conf,
+            "used_imgsz": used_imgsz,
+            "source": "yolov8n-knife",
+        }
+    except Exception:
+        pass
+    return has_knife, detections, result
 
 
 def _load_or_build_poi_db(enforce_detection: bool = False) -> dict[str, Any]:
@@ -282,6 +470,65 @@ def _load_or_build_poi_db(enforce_detection: bool = False) -> dict[str, Any]:
     return payload
 
 
+def _load_poi_metadata() -> dict[str, dict[str, Any]]:
+    if not POI_METADATA_PATH.exists():
+        return {}
+
+    try:
+        payload = json.loads(POI_METADATA_PATH.read_text())
+    except Exception:
+        return {}
+
+    records = payload.get("records")
+    if not isinstance(records, list):
+        return {}
+
+    metadata_by_key: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        keys = [
+            record.get("image_filename"),
+            record.get("name"),
+            record.get("full_name"),
+        ]
+        for key in keys:
+            if isinstance(key, str) and key.strip():
+                metadata_by_key[key.strip().lower()] = record
+    return metadata_by_key
+
+
+def _poi_metadata_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    metadata = _load_poi_metadata()
+    image_path = entry.get("image_path")
+    image_name = Path(str(image_path)).name.lower() if image_path else None
+    keys = [
+        image_name,
+        str(entry.get("name") or "").strip().lower() or None,
+        str(entry.get("full_name") or "").strip().lower() or None,
+    ]
+    for key in keys:
+        if key and key in metadata:
+            return metadata[key]
+    return {}
+
+
+def _poi_details_from_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+    metadata = _poi_metadata_for_entry(entry)
+    details = {
+        "name": metadata.get("full_name") or entry.get("full_name") or metadata.get("name") or entry.get("name"),
+        "age": metadata.get("age", entry.get("age")),
+        "dob": metadata.get("dob", entry.get("dob")),
+        "crime": metadata.get("crime", entry.get("crime")),
+        "wanted": metadata.get("wanted", entry.get("wanted")),
+        "extra_info": metadata.get("extra_info", entry.get("extra_info")),
+    }
+    if any(v is not None for v in details.values()):
+        return details
+    return None
+
+
 def _run_poi_match_bytes(data: bytes, suffix: str) -> dict[str, Any]:
     try:
         from deepface import DeepFace
@@ -313,34 +560,34 @@ def _run_poi_match_bytes(data: bytes, suffix: str) -> dict[str, Any]:
         if suspect_emb is None:
             raise HTTPException(status_code=400, detail="No face embedding could be computed for this image.")
 
-        best = None
+        best_entry = None
+        best_distance = None
         for entry in entries:
             emb = entry.get("embedding")
             if not emb:
                 continue
             dist = _cosine_distance(suspect_emb, emb)
-            if best is None or dist < best["distance"]:
-                best = {
-                    "name": entry.get("name"),
-                    "image_path": entry.get("image_path"),
-                    "distance": dist,
-                }
+            if best_distance is None or dist < best_distance:
+                best_entry = entry
+                best_distance = dist
 
-        if best is None:
+        if best_entry is None or best_distance is None:
             raise HTTPException(status_code=400, detail="No valid embeddings in POI database.")
 
         threshold = _poi_threshold()
-        match = float(best["distance"]) <= float(threshold)
+        match = float(best_distance) <= float(threshold)
+        poi_details = _poi_details_from_entry(best_entry)
 
         return {
             "match": bool(match),
-            "distance": float(best["distance"]),
+            "distance": float(best_distance),
             "threshold": float(threshold),
             "model_name": POI_MODEL_NAME,
             "detector_backend": POI_DETECTOR_BACKEND,
             "distance_metric": POI_DISTANCE_METRIC,
-            "poi_name": best.get("name"),
-            "poi_image_path": _normalize_repo_rel_path(best.get("image_path")),
+            "poi_name": best_entry.get("name"),
+            "poi_image_path": _normalize_repo_rel_path(best_entry.get("image_path")),
+            "poi_details": poi_details,
         }
     finally:
         if tmp_path and tmp_path.exists():
@@ -350,15 +597,69 @@ def _run_poi_match_bytes(data: bytes, suffix: str) -> dict[str, Any]:
                 pass
 
 
-@app.get("/api/health")
-def health():
-    return {"ok": True}
+def _run_weapon_detection_bytes(data: bytes, suffix: str, conf_threshold: float = DEFAULT_WEAPON_CONF) -> dict[str, Any]:
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+        tmp_path.write_bytes(data)
+
+        has_gun, gun_detections, gun_result = detect_weapons(
+            tmp_path,
+            weights_path=DEFAULT_WEIGHTS_PATH,
+            conf_threshold=conf_threshold,
+        )
+        has_knife, knife_detections, knife_result = _detect_knives(
+            tmp_path,
+            weights_path=KNIFE_WEIGHTS_PATH,
+            conf_threshold=conf_threshold,
+        )
+        detections = [*gun_detections, *knife_detections]
+        has_weapon = bool(has_gun) or bool(has_knife)
+        annotated_result = gun_result if gun_detections else knife_result
+        annotated_png_b64 = _result_plot_png_base64(annotated_result) if annotated_result is not None else None
+        meta = {
+            "gun": getattr(gun_result, "_meta", None) if gun_result is not None else None,
+            "knife": getattr(knife_result, "_meta", None) if knife_result is not None else None,
+        }
+
+        return {
+            "has_gun": bool(has_gun),
+            "has_weapon": bool(has_weapon),
+            "has_knife": bool(has_knife),
+            "confidence_threshold": float(conf_threshold),
+            "weights_path": str(Path(DEFAULT_WEIGHTS_PATH)),
+            "detections": [
+                {
+                    "class_id": d.class_id,
+                    "label": d.label,
+                    "confidence": d.confidence,
+                    "xyxy": d.xyxy,
+                }
+                for d in detections
+            ],
+            "annotated_png_base64": annotated_png_b64,
+            "warning": None,
+            "debug": meta,
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"IR detection failed: {type(e).__name__}: {e}")
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
-@app.get("/api/camera/frame")
-def camera_frame():
+def _proxy_pi_frame(route: str) -> Response:
     base = _pi_base_url()
-    url = f"{base}/api/camera/frame"
+    url = f"{base}{route}"
     try:
         r = httpx.get(url, timeout=httpx.Timeout(5.0, connect=3.0))
     except Exception as e:
@@ -372,10 +673,9 @@ def camera_frame():
     )
 
 
-@app.get("/api/camera/stream")
-async def camera_stream():
+async def _proxy_pi_stream(route: str) -> StreamingResponse:
     base = _pi_base_url()
-    url = f"{base}/api/camera/stream"
+    url = f"{base}{route}"
 
     timeout = httpx.Timeout(connect=3.0, read=None)
     client = httpx.AsyncClient(timeout=timeout)
@@ -407,10 +707,140 @@ async def camera_stream():
     )
 
 
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/api/logs")
+def logs(tail: int = 200):
+    if tail < 1 or tail > 5000:
+        raise HTTPException(status_code=400, detail="tail must be between 1 and 5000.")
+    if not LOG_FILE.exists():
+        return {"path": str(LOG_FILE), "lines": []}
+
+    text = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()[-tail:]
+    return {"path": str(LOG_FILE), "lines": lines}
+
+
 @app.get("/api/images")
 def list_images(scope: str = "repo", limit: int = 200):
-    # Minimal stub to keep frontend happy.
-    return {"scope": scope, "count": 0, "items": []}
+    if limit < 1 or limit > 2000:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 2000.")
+
+    root = CAPSTONE_BACKEND if scope == "backend" else REPO_ROOT if scope == "repo" else None
+    if root is None:
+        raise HTTPException(status_code=400, detail="scope must be 'backend' or 'repo'.")
+
+    items: list[dict[str, Any]] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in IMAGE_EXTS:
+            continue
+        rel = p.relative_to(REPO_ROOT).as_posix()
+        items.append(
+            {
+                "path": rel,
+                "name": p.name,
+                "thumb_jpeg_base64": _thumbnail_base64(p),
+            }
+        )
+        if len(items) >= limit:
+            break
+
+    return {"scope": scope, "count": len(items), "items": items}
+
+
+@app.post("/api/detect")
+async def detect(file: UploadFile = File(...), conf_threshold: float = DEFAULT_WEAPON_CONF) -> dict[str, Any]:
+    suffix = Path(file.filename or "upload.jpg").suffix or ".jpg"
+    data = await file.read()
+    return _run_weapon_detection_bytes(data, suffix, conf_threshold=conf_threshold)
+
+
+@app.post("/api/detect-path")
+def detect_path(req: DetectPathRequest) -> dict[str, Any]:
+    image_path = _resolve_user_path(req.path)
+    weights_path = Path(req.weights_path) if req.weights_path else DEFAULT_WEIGHTS_PATH
+
+    if not image_path.exists():
+        raise HTTPException(status_code=400, detail=f"Image path does not exist: {image_path}")
+    if not weights_path.exists():
+        raise HTTPException(status_code=400, detail=f"Weights path does not exist: {weights_path}")
+
+    try:
+        has_gun, gun_detections, gun_result = detect_weapons(
+            image_path,
+            weights_path=weights_path,
+            conf_threshold=req.conf_threshold,
+        )
+        has_knife, knife_detections, knife_result = _detect_knives(
+            image_path,
+            weights_path=KNIFE_WEIGHTS_PATH,
+            conf_threshold=req.conf_threshold,
+        )
+        detections = [*gun_detections, *knife_detections]
+        has_weapon = bool(has_gun) or bool(has_knife)
+        annotated_result = gun_result if gun_detections else knife_result
+        annotated_png_b64 = _result_plot_png_base64(annotated_result) if annotated_result is not None else None
+        meta = {
+            "gun": getattr(gun_result, "_meta", None) if gun_result is not None else None,
+            "knife": getattr(knife_result, "_meta", None) if knife_result is not None else None,
+        }
+
+        return {
+            "has_gun": bool(has_gun),
+            "has_weapon": bool(has_weapon),
+            "has_knife": bool(has_knife),
+            "confidence_threshold": float(req.conf_threshold),
+            "weights_path": str(weights_path),
+            "image_path": str(image_path),
+            "detections": [
+                {
+                    "class_id": d.class_id,
+                    "label": d.label,
+                    "confidence": d.confidence,
+                    "xyxy": d.xyxy,
+                }
+                for d in detections
+            ],
+            "annotated_png_base64": annotated_png_b64,
+            "warning": None,
+            "debug": meta,
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("detect path failed (path=%s): %s", image_path, e)
+        raise HTTPException(status_code=500, detail=f"Detection failed: {type(e).__name__}: {e}. See backend logs at /api/logs")
+
+
+@app.get("/api/camera/frame")
+def camera_frame():
+    return _proxy_pi_frame("/api/camera/frame")
+
+
+@app.get("/api/camera/stream")
+async def camera_stream():
+    return await _proxy_pi_stream("/api/camera/stream")
+
+
+@app.get("/api/ir/frame")
+def ir_frame():
+    return _proxy_pi_frame("/api/ir/frame")
+
+
+@app.get("/api/ir/stream")
+async def ir_stream():
+    return await _proxy_pi_stream("/api/ir/stream")
+
+
+@app.get("/api/ir/detect")
+def ir_detect(conf_threshold: float = DEFAULT_WEAPON_CONF) -> dict[str, Any]:
+    frame = _proxy_pi_frame("/api/ir/frame")
+    return _run_weapon_detection_bytes(frame.body, ".jpg", conf_threshold=conf_threshold)
 
 
 @app.get("/api/image")
@@ -418,12 +848,9 @@ def get_image(path: str):
     resolved = _resolve_user_path(path)
     if not resolved.exists():
         raise HTTPException(status_code=404, detail="Image not found.")
+    if resolved.suffix.lower() not in IMAGE_EXTS:
+        raise HTTPException(status_code=400, detail="Not a supported image type.")
     return FileResponse(resolved)
-
-
-@app.get("/api/logs")
-def logs(tail: int = 200):
-    return {"lines": []}
 
 
 @app.post("/api/detect-person")

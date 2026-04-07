@@ -8,13 +8,38 @@ Entry scripts live in `backend/scripts/`:
 - `build_poi_db.py` — build DeepFace embeddings JSON from `backend/data/faces/poi/`
 - `recognize_poi.py` — match a suspect image against POI images via DeepFace
 
-Docs: `docs/CODEBASE_DOCUMENTATION.md`
+## Runtime Services
 
-## API (for the frontend)
+For the `rgb/integrationTest` flow, use the repo-root server files:
 
-Start the API server:
+- `pc_server.py` — run this on the PC or Mac that hosts the frontend
+- `pi_camera_server.py` — run this on the Raspberry Pi
 
-- macOS/Linux: `python3 -m uvicorn backend.api.main:app --reload --port 8000`
-- Windows: `py -m uvicorn backend.api.main:app --reload --port 8000`
+The copies in `backend/pc_server.py` and `backend/pi_camera_server.py` are compatibility wrappers that forward to the repo-root modules.
 
-Note: run this from a virtualenv where `pip install -r requirements.txt` was installed (don’t rely on `brew install uvicorn`).
+## Install
+
+From the `PeekIR` repo root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r CapstoneProject/requirements.txt
+```
+
+## Run The PC Backend
+
+```bash
+source .venv/bin/activate
+export PI_CAMERA_BASE_URL=http://<pi-ip>:9000
+python -m uvicorn pc_server:app --host 0.0.0.0 --port 8000
+```
+
+## Run The Pi Camera Service
+
+```bash
+sudo apt-get install -y python3-picamera2
+source .venv/bin/activate
+python -m uvicorn pi_camera_server:app --host 0.0.0.0 --port 9000
+```
