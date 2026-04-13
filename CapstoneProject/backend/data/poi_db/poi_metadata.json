@@ -1,0 +1,63 @@
+{
+  "records": [
+    {
+      "name": "Havish",
+      "image_filename": "Havish.PNG",
+      "full_name": "Havish Bandapalli",
+      "age": 21,
+      "dob": "05/22/2004",
+      "crime": "Went 120 mph in a school zone and crashed into 3 kids",
+      "wanted": true,
+      "extra_info": "All 3 kids passed away on impact"
+    },
+    {
+      "name": "Trisha",
+      "image_filename": "Trisha.jpeg",
+      "full_name": "Trisha Kommitla",
+      "age": 21,
+      "dob": "08/27/2004",
+      "crime": "Got caught shoplifting at Sephora",
+      "wanted": false,
+      "extra_info": "She tried to steal items worth $345"
+    },
+    {
+      "name": "Vidhya",
+      "image_filename": "Vidhya.JPG",
+      "full_name": "Vidhya Kommineni",
+      "age": 21,
+      "dob": "04/25/2004",
+      "crime": "Hit and run",
+      "wanted": true
+    },
+    {
+      "name": "Rayaan",
+      "image_filename": "Rayaan.PNG",
+      "full_name": "Rayaan Naveed",
+      "age": 21,
+      "dob": "06/06/2004",
+      "crime": "Got caught selling illegal substances to middle schoolers",
+      "wanted": false,
+      "extra_info": "Spent a month in jail before getting released"
+    },
+    {
+      "name": "Sean",
+      "image_filename": "Sean.png",
+      "full_name": "Sean Conway",
+      "age": 23,
+      "dob": "01/08/2003",
+      "crime": "Got into a fight on campus grounds",
+      "wanted": false,
+      "extra_info": "He lost the fight"
+    },
+    {
+      "name": "Rajat",
+      "image_filename": "Rajat.jpeg",
+      "full_name": "Rajat Sarkar",
+      "age": 22,
+      "dob": "11/27/2003",
+      "crime": "Stabbed an elderly lady in the park and fled the crime scene",
+      "wanted": true,
+      "extra_info": "Last seen at the Aggie Park"
+    }
+  ]
+}
