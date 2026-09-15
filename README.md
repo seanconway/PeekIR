@@ -1,165 +1,181 @@
-If you have any questions feel free to reach out to me @ arikrahman300@gmail.com or arik.fm on discord
+# PeekIR Dashboard System
 
-# SafeHaven
+`peekir_dashboard.py` is the central control surface for the full PeekIR app. From one UI, operators can:
 
-SafeHaven is an automated system designed to detect human presence using computer vision and perform targeted Synthetic Aperture Radar (SAR) scans using a 2-axis gantry system.
+- run mmWave SAR scans and 3D reconstruction
+- load and view previously reconstructed interactive scans
+- monitor RGB and IR camera streams from the Raspberry Pi
+- run face matching against a wanted-person database
+- run IR gun detection on captured IR frames
+- pair and monitor a Bluetooth metal detector (metal state + battery)
 
-## Project Overview
+---
 
-You're going to want to clone this repository on the Raspberry Pi 5 as well as the computer with mmWave installed onto it. 
+## Core Components
 
-Check out the software manual for mmWave studio setup tutorial. You're going to want to generate local ssh key and export those credentials to Raspberry Pi 5 so it doesn't prompt for ssh password each time. 
+| Component | Runs on | Purpose |
+|---|---|---|
+| `peekir_dashboard.py` | Windows/laptop | Main FastAPI dashboard + web UI + orchestration |
+| `sar_complete.py` | Windows/laptop | One-shot SAR pipeline: capture (`sar_coordinator.py`) + reconstruct (`sar_reconstruct.py`) |
+| `sar_coordinator.py` | Windows (with mmWave Studio) | TCP orchestrator between radar client and Pi gantry client |
+| `sar_scan_tcp.lua` | mmWave Studio host | Radar/DCA1000 client controlled by coordinator commands |
+| `move.py tcp` | Raspberry Pi | Gantry TCP client for XY movement commands |
+| `pi_camera_server.py` | Raspberry Pi | RGB/IR camera stream and frame API used by the dashboard |
+| `metal_detector.py` | Windows/laptop | BLE integration for metal-detection notifications and battery |
+| `sar_reconstruct.py` | Windows/laptop | SAR reconstruction and visualization artifact generation |
 
-- (We suggest future groups set up an ssh server for faster communication and better throughput, rather than our approach of one off ssh connections)
+---
 
-The system operates in the following sequence:
-1.  **Detection**: A camera (PiCamera) captures the scene.
-2.  **Identification**: YOLO (You Only Look Once) object detection identifies people in the frame.
-3.  **Path Generation**: A "Snake Path" algorithm calculates an optimal scanning route for the gantry to cover the detected area.
-4.  **Scanning**: The gantry moves a SAR sensor along the calculated path to acquire data.
-5.  **Processing**: MATLAB scripts process the raw radar data to reconstruct images.
+## Full App Workflow
 
-## Directory Structure
+### 1) mmWave Data Collection (from dashboard)
 
-*   **SoftwareDemo/**: The main application code.
-    *   `main.py`: Entry point for the integrated system.
-    *   `PiCamera/`: Camera control and AI detection logic.
-    *   `GantryFunctionality/`: Motor control, limit switches, and safety stop mechanisms.
-    *   `SnakepathAlgorithm/`: Path generation logic.
-*   **Arduino/**: Firmware for the microcontroller driving the stepper motors.
-*   **MATLAB/**: Algorithms for SAR signal processing and image reconstruction.
-*   **BoundaryBoxDetect/**: Standalone scripts for testing object detection and coordinate mapping.
-*   **SnakePathAlgorithm/**: Standalone development of the path planning algorithm.
+In **mmWave data collection**, the user enters:
 
-## Core Files & Key Scripts
+- `width_mm`
+- `height_mm`
+- `scan_name`
 
-### Radar Scanning (Lua)
-*   **`Safehaven-Lua/sar_scan_rev15.lua`**
-    *   **Purpose:** The main automation script run within TI mmWave Studio. It controls the radar parameters and triggers the scanning sequence.
-
-### Data Processing & SAR Generation
-*   **`Safehaven-Lua/mainSARneuronauts2py_rev3_2.py`**
-    *   **Purpose:** The primary script for processing raw binary radar data into visual Synthetic Aperture Radar (SAR) images.
-    *   **Arguments:**
-        *   `--folder`: Folder containing scan data (default: 'dumps').
-        *   `--zindex`: Single Z slice to process (e.g., '300', '300mm', '0.3m').
-        *   `--zstep`: Step size for Z sweep (e.g., '3', '3mm', '0.003m').
-        *   `--zstart` / `--z_start`: Start Z value for sweep (e.g., '300', '300mm', '0.3m').
-        *   `--zend` / `--z_end`: End Z value for sweep (e.g., '800', '800mm', '0.8m').
-        *   `--xyonly`: Only generate the X-Y image; skip X-Z and Y-Z heatmaps.
-        *   `--3d_scatter`: Generate interactive 3D scatter plot.
-        *   `--3d_scatter_intensity`: Initial percentile threshold for 3D scatter plot (0-100, default: 95.0).
-        *   `--plotly`: Generate interactive Plotly HTML with Z-slider instead of Matplotlib window.
-        *   `--mat_plot_lib`: Force use of Matplotlib for visualization, overriding --plotly.
-        *   `--sar_dump`: Directory to dump processed SAR images (Z-slices).
-        *   `--silent`: Suppress all graphical output and heatmap generation.
-        *   `--algo`: Reconstruction algorithm: 'mf' (Matched Filter), 'fista', or 'bpa' (default: 'mf').
-        *   `--fista_iters`: Number of FISTA iterations (default: 20).
-        *   `--fista_lambda`: FISTA regularization ratio (0.0 to 1.0) (default: 0.05).
-        *   `--frames_in_x`: Number of frames in X dimension (default: 800).
-        *   `--frames_in_y`: Number of frames in Y dimension (default: 40).
-
-*   **`Safehaven-Lua/batch_process_dumps.py`**
-    *   **Purpose:** Handles pre-processing of data dumps (grayscaling, normalization) to prepare them for the Machine Learning pipeline.
-
-### Motor Control
-*   **`SoftwareDemo/GantryFunctionality/MotorTest/motorTest_rev13.py`**
-    *   **Purpose:** The driver script for the 2-axis gantry system. It interprets commands (often from the Lua script or Main Orchestrator) to move the stepper motors.
-
-### AI & Computer Vision
-*   **`Safehaven-Classification/weapon_classifier.py`**
-    *   **Purpose:** The Object Classification module. It uses a trained model to detect and classify weapons within the processed SAR images.
-
-*   **`SoftwareDemo/PiCamera/HeadlessPersonTracker.py`**
-    *   **Purpose:** Runs the computer vision logic (YOLO) to track persons and faces in real-time without requiring a display output (headless mode).
-
-## Installation
-
-### Prerequisites
-*   Python 3.9+
-*   uv (Python package installer)
-*   Raspberry Pi (for the main controller)
-*   Arduino (for motor control)
-*   MATLAB (for data processing)
-
-### Python Dependencies
-First, install uv if not already installed:
+When they press **Start scan**, `peekir_dashboard.py` starts:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+python sar_complete.py -W <width_mm> -H <height_mm> --scan-name <scan_name> --viz-html-root visualizations
 ```
 
-Then, install the required packages using uv sync:
+`sar_complete.py` then:
+
+1. Launches scan capture through `sar_coordinator.py`
+2. Waits for scan completion
+3. Launches `sar_reconstruct.py` on the captured data
+4. Emits progress messages the dashboard consumes for live status/progress bar updates
+
+### 2) SAR Control Chain
+
+`sar_coordinator.py` is the real-time orchestrator. It accepts two persistent TCP clients:
+
+- `RADAR` (`sar_scan_tcp.lua`)
+- `GANTRY` (`move.py tcp` on Pi)
+
+Per row, coordinator logic performs:
+
+1. `ARM <row_file>` to radar/DCA1000
+2. Start gantry movement (`MOVE ...`)
+3. Wait for `MOTOR_STARTED` (+ optional stabilization)
+4. Trigger `CAPTURE`
+5. Wait for both `CAPTURE_DONE` and `MOVE_COMPLETE`
+6. Continue in snake/raster pattern
+
+This deterministic TCP timing is what keeps radar captures aligned with aperture position.
+
+### 3) SAR Reconstruction and 3D Imaging Logic
+
+`sar_reconstruct.py` converts row `.bin` files into spatial imagery by:
+
+1. **Range FFT** on FMCW ADC data (extract depth-frequency information)
+2. **Depth slicing** over Z (`zstart` to `zend`, or single `zindex`)
+3. For each Z slice, **aperture-domain reconstruction** (`mf`, `fista`, or `bpa`)
+4. Build a volumetric stack across Z
+5. Export:
+   - XY max-intensity projection
+   - XZ and YZ projections
+   - interactive Plotly Z-slice HTML viewer
+   - optional GIF / optional 3D scatter
+
+Why this enables 3D SAR with this setup:
+
+- The XY gantry synthesizes a larger aperture by moving the radar spatially.
+- FMCW chirps provide range/depth sensitivity (Z dimension).
+- Coherent combination of echoes across aperture positions + depth focusing reconstructs volumetric structure, which is then visualized as sliceable 3D data.
+
+---
+
+## Dashboard Features
+
+### mmWave Visualization
+
+- The dashboard lists available HTML viewers from `visualizations/`.
+- Users can load completed scans into the embedded interactive viewer.
+- Viewers are generated by `sar_reconstruct.py` and selected through the **mmWave visualization** panel.
+
+### RGB Camera + Face Recognition
+
+- Dashboard displays live RGB feed from `pi_camera_server.py` (`/api/camera/stream`).
+- On **Capture RGB**, it pulls one frame and runs local matching with:
+  - ArcFace embedding (`DeepFace`)
+  - cosine-distance comparison against precomputed wanted-person embeddings (`facial_rec/demo_embedding.json`)
+- If matched under threshold, UI surfaces wanted person match immediately with annotated capture.
+
+### IR Camera + Gun Detection
+
+- Dashboard displays live IR feed from `pi_camera_server.py` (`/api/ir/stream`).
+- On **Capture IR**, it snapshots IR frame and runs local YOLO inference (`weapon_detection` weights).
+- UI returns annotated frame + real-time status (`Gun detected` / `No gun detected`).
+- Model is trained for IR imagery captured from the same camera domain.
+
+### Bluetooth Metal Detector Integration
+
+- Dashboard pairs/monitors BLE device through `metal_detector.py`.
+- Incoming notifications are streamed over WebSocket to the UI.
+- UI displays:
+  - connection state (connecting/connected/error/stopped)
+  - metal state (`HIGH` / `LOW`)
+  - battery percentage
+- Visual alerting is triggered when metal is detected.
+
+---
+
+## Running the Dashboard
 
 ```bash
-uv sync
+python peekir_dashboard.py
 ```
 
-This will install all dependencies listed in `pyproject.toml`.
-
-For the SoftwareDemo specifically:
+Alternative:
 
 ```bash
-cd SoftwareDemo
-uv sync
+uvicorn peekir_dashboard:app --host 127.0.0.1 --port 8080
 ```
 
-*Note: The project uses uv for dependency management. If you prefer manual installation, you can use `uv pip install matplotlib numpy opencv-python pynput ultralytics torch torchvision torchaudio pandas requests`.*
+The dashboard is typically run on the Windows/laptop machine adjacent to mmWave Studio.
 
-## Usage
+---
 
-### Running the Main System
-To start the full detection and scanning sequence:
+## Important Runtime Notes
+
+- `peekir_dashboard.py` can auto-start `pi_camera_server.py` over SSH (configurable via env vars).
+- SAR outputs are written under `outputs/<scan_name>/`.
+- Interactive SAR HTML files for dashboard loading are written to `visualizations/`.
+- Scan names must be unique across both `outputs/` and `visualizations/`.
+
+---
+
+## Key Environment Variables
+
+- `PI_BASE_URL` (default `http://10.244.13.117:9000`)
+- `PI_SSH_AUTO_START` (`1`/`0`)
+- `PI_SSH_HOST`, `PI_SSH_USER`, `PI_SSH_PROJECT_DIR`, `PI_SSH_VENV`
+- `PEEKIR_POI_DB`
+- `PEEKIR_FACE_COSINE_THRESHOLD`
+- `PEEKIR_IR_GUN_WEIGHTS`
+- `PEEKIR_IR_GUN_CONF`
+- `PEEKIR_DATA_ROOT`
+
+---
+
+## Direct SAR CLI (optional, without dashboard)
+
+You can still run SAR capture/reconstruction directly:
 
 ```bash
-python SoftwareDemo/main.py
+python sar_complete.py -W 150 -H 150 --scan-name scan_test
 ```
 
-## Changing Scan Speed
+or manually split orchestration and reconstruction:
 
-To adjust the scanning speed (e.g., slowing down from 36mm/s to 18mm/s), updates are required in the automation script and data processing script. The motor control script (`motorTest_rev13.py`) accepts a speed argument and does not need to be modified directly.
-
-### 1. Automation Script (`Safehaven-Lua/sar_scan_rev15.lua`)
-Update the speed variable, frame count, and return wait time.
-*   **Speed**: Set `speed_mms` to the new value. This value is passed to the motor script automatically.
-*   **Frame Count**: Ensure the total duration covers the scan distance.
-    *   `num_frames = Distance / (Speed * Periodicity)`
-    *   *Example*: `280mm / (18mm/s * 0.018s) ≈ 864 frames` (Round to nearest convenient number, e.g., 800 or 864).
-*   **Return Wait**: Calculate time to return to start.
-    *   `return_wait = (Distance / Speed) * 1000 + Buffer`
-
-```lua
--- sar_scan_rev15.lua
-local speed_mms = 18 -- This is passed to motorTest_rev13.py
-local num_frames = 800 -- Update based on new speed
--- Update return wait time (e.g., 17000ms for 18mm/s)
-local return_wait = 17000 
+```bash
+python sar_coordinator.py
+python sar_reconstruct.py --folder outputs/scan_0 --plotly
 ```
-
-### 2. Data Processing (`Safehaven-Lua/mainSARneuronauts2py_rev3_2.py`)
-Update the reconstruction parameters to match the new data format.
-*   **X Dimension**: Set `X` to the new `num_frames`.
-*   **Step Size (dx)**: Update the spatial step size.
-    *   `dx = Speed (mm/s) * Periodicity (s)`
-    *   *Example*: `18 * 0.018 = 0.324 mm`
-
-```python
-# mainSARneuronauts2py_rev3_2.py
-X = 800 # Must match num_frames from Lua script
-dx = 18 * 0.018 # Update dx calculation
-```
-
-Ensure you are in the root directory or adjust paths accordingly.
-
-### Hardware Setup
-*   **Motors**: Connected via Arduino. Ensure the Arduino is flashed with the code in `Arduino/simpleMain.cpp` (or relevant file).
-*   **Camera**: Raspberry Pi Camera Module.
-*   **Safety**: Ensure Emergency Stop and Limit Switches are connected.
-
-### Coordinate System
-*   **Origin**: The system assumes the starting position is the **Top-Left** corner.
-*   **Coordinates**: In the user's Cartesian system, this Top-Left corner is defined as **(0, 0)**.
-
 ## Development
 
 *   **AI/ML**: The project uses YOLOv5/v8/v11 models (`yolov5s.pt`, `yolov8n.pt`).
